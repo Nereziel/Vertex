@@ -981,6 +981,65 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
+// Reuse the worker's temporary byte storage. Never hold a TLS borrow
+// across a read/decode or nested destination fill. Cap retained memory,
+// not the size of a valid request; oversized buffers are simply dropped.
+const SCRATCH_LIMIT: usize = 4 << 20;
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct Scratch(Vec<u8>);
+
+impl Scratch {
+    fn new(len: usize) -> Self {
+        let mut bytes = SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+        bytes.resize(len, 0);
+        // The old paths used vec![0; len], including short decodes.
+        bytes.fill(0);
+        Self(bytes)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if self.0.capacity() <= SCRATCH_LIMIT {
+            self.0.clear();
+            let _ = SCRATCH.try_with(|slot| {
+                let mut kept = slot.borrow_mut();
+                if self.0.capacity() > kept.capacity() {
+                    *kept = std::mem::take(&mut self.0);
+                }
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::{Scratch, SCRATCH, SCRATCH_LIMIT};
+
+    #[test]
+    fn reuse_is_zeroed_and_nested_buffers_are_independent() {
+        SCRATCH.with(|slot| slot.borrow_mut().clear());
+        let mut first = Scratch::new(64);
+        first.0.fill(0xa5);
+        let ptr = first.0.as_ptr();
+        drop(first);
+        let mut second = Scratch::new(32);
+        assert_eq!(second.0.as_ptr(), ptr);
+        assert_eq!(second.0, vec![0; 32]);
+        second.0.fill(0x12);
+        let inner = Scratch::new(32);
+        assert_eq!(inner.0, vec![0; 32]);
+        assert_eq!(second.0, vec![0x12; 32]);
+        drop(inner);
+        drop(second);
+        drop(Scratch::new(SCRATCH_LIMIT + 1));
+        SCRATCH.with(|slot| assert!(slot.borrow().capacity() <= SCRATCH_LIMIT));
+    }
+}
+
 fn execute(request: &Request, pages: Option<&PageRuns>) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
@@ -1023,9 +1082,9 @@ fn execute(request: &Request, pages: Option<&PageRuns>) -> Result<(), HRESULT> {
             if !bounce {
                 return read_into(request, out).map(|()| size);
             }
-            let mut data = vec![0; size];
-            read_into(request, &mut data)?;
-            out.copy_from_slice(&data);
+            let mut data = Scratch::new(size);
+            read_into(request, &mut data.0)?;
+            out.copy_from_slice(&data.0);
             Ok(size)
         })
         .map_err(|hr| fail(hr, "copying"));
@@ -1242,8 +1301,8 @@ fn into_destination(
         runs.written(len);
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
+    let mut data = Scratch::new(len);
+    let n = fill(&mut data.0)?;
     // A page the title has just made, or a view the host refuses for a
     // moment, comes right a little later: the write is tried again before
     // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
@@ -1257,7 +1316,7 @@ fn into_destination(
     // Since the start: writes that succeeded on a later try, and writes
     // given up.
     static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    let write = || runs.is_some_and(|runs| runs.write(&data[..n]));
+    let write = || runs.is_some_and(|runs| runs.write(&data.0[..n]));
     let mut written = write();
     let mut tries = 0u32;
     while !written && runs.is_some() && tries < retries {
