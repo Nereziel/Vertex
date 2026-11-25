@@ -115,6 +115,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 
 | Variable | Effect |
 |---|---|
+| `VICTORY_TEXTURE_SWEEP_REMAP=1` | experimental: retire unused texture copies after their source memory is remapped, rather than waiting for idle time; off by default |
 | `VICTORY_TEXTURE_SHARE=33` | the share of each frame, in percent, the texture pass may take. Lower: smoother, textures come in later. `0`: no limit, as before |
 | `VICTORY_TEXTURE_STAGE_MS=250` | the most that pass may take in any case, in ms (three times that with a large backlog) |
 | `VICTORY_TEXTURE_BUDGET_MB=<n>` | at most this much card memory for those textures: less pressure on memory, blurrier picture |
