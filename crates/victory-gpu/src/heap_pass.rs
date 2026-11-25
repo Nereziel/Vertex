@@ -44,6 +44,7 @@ struct Slot {
     record: Record,
     /// The view is an unordered access one: shaders may store through it
     /// (`crate::heap_marks` asks about every slot kept, every pass).
+    #[cfg(test)]
     unordered: bool,
 }
 
@@ -220,7 +221,16 @@ impl<C: Clone> Picked<C> {
     ) {
         self.forget(slot);
         self.note_entry(slot, entry);
-        self.slots.insert(slot, Slot { copy: key, from, to, record, unordered });
+        #[cfg(not(test))]
+        let _ = unordered;
+        self.slots.insert(slot, Slot {
+            copy: key,
+            from,
+            to,
+            record,
+            #[cfg(test)]
+            unordered,
+        });
         let c = self.copies.entry(key).or_insert_with(|| Copy {
             copy: copy.clone(),
             slots: HashSet::new(),
@@ -257,6 +267,7 @@ impl<C: Clone> Picked<C> {
 
     /// Every slot kept (whether or not this pass looked at it), and whether
     /// its view is an unordered access one.
+    #[cfg(test)]
     pub(crate) fn unordered(&self) -> impl Iterator<Item = (u32, bool)> + '_ {
         self.slots.iter().map(|(&slot, s)| (slot, s.unordered))
     }
@@ -264,6 +275,7 @@ impl<C: Clone> Picked<C> {
     /// What the view of `slot` reads, if the slot is kept: its host copy,
     /// the range `(from, to)`, and whether the view is an unordered access
     /// one.
+    #[cfg(test)]
     pub(crate) fn view(&self, slot: u32) -> Option<(&C, u64, u64, bool)> {
         let s = self.slots.get(&slot)?;
         Some((&self.copies.get(&s.copy)?.copy, s.from, s.to, s.unordered))

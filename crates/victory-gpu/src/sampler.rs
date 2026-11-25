@@ -125,6 +125,7 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
 
 /// The comparison sampler that filters as `desc` does, with its function
 /// (never, if it has none).
+#[cfg(test)]
 pub(crate) fn comparison(desc: D3D12_SAMPLER_DESC) -> D3D12_SAMPLER_DESC {
     // The reduction is in bits 7 and 8: none, comparison, minimum, maximum.
     const REDUCTION: i32 = 3 << 7;

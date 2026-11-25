@@ -1073,6 +1073,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
 
 /// [`page_window`] through the views `mapping` names, so tests reach either
 /// path without the environment.
+#[cfg(test)]
 fn page_window_with(mapping: Mapping, pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
     resolve_pages(pages, offset, len)?.window_with(mapping)
 }

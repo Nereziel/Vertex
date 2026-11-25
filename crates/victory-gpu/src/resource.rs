@@ -2119,6 +2119,7 @@ fn unmapped_due(ranges: &[(u64, u64)], start: u64, len: u64) -> bool {
 /// does thousands of these a second while it loads.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
+#[allow(dead_code, reason = "the remap-driven sweep is not wired in the baseline; do not activate it as part of warning cleanup")]
 pub(crate) fn note_unmapped(base: u64, len: u64) {
     if !sweeping() || len == 0 {
         return;
