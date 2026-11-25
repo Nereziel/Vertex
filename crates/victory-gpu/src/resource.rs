@@ -1546,7 +1546,8 @@ pub(crate) fn host_made<'a>(
 
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
+/// up to 2 GiB of them (at most a third of the adapter budget), beyond
+/// that while the card's memory in use
 /// by this process is under nine tenths of the budget the system gives it
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
@@ -1554,7 +1555,6 @@ pub(crate) fn host_made<'a>(
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -1567,7 +1567,18 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    if filled < FLOOR {
+    // Cache the first real budget, not a temporary failure to query it.
+    // Preserve the previous 2 GiB floor on adapters with at least 6 GiB
+    // available, but do not crowd out render targets on small adapters.
+    static FLOOR_HERE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let floor = match FLOOR_HERE.get() {
+        Some(&floor) => floor,
+        None => match crate::host::host().and_then(|h| h.video_memory()) {
+            Some([budget, ..]) if budget != 0 => *FLOOR_HERE.get_or_init(|| texture_floor(budget)),
+            _ => 2 << 30,
+        },
+    };
+    if filled < floor {
         return true;
     }
     // Placed textures nothing holds any more give their ranges back here
@@ -1586,6 +1597,12 @@ pub(crate) fn room() -> bool {
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// The minimum texture allowance must leave room for other allocations.
+#[cfg(windows)]
+fn texture_floor(budget: u64) -> u64 {
+    (2u64 << 30).min(budget / 3)
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -2120,7 +2137,11 @@ fn unmapped_due(ranges: &[(u64, u64)], start: u64, len: u64) -> bool {
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
 pub(crate) fn note_unmapped(base: u64, len: u64) {
-    if !sweeping() || len == 0 {
+    // The early sweep used to have no caller in Vertex. Keep the existing
+    // runtime default until the remap-heavy loading path is benchmarked.
+    static EARLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*EARLY.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP_REMAP").is_some_and(|v| v == "1"))
+        || !sweeping() || len == 0 {
         return;
     }
     let mut u = UNMAPPED.lock().unwrap_or_else(|e| e.into_inner());
@@ -2138,9 +2159,6 @@ pub(crate) fn note_unmapped(base: u64, len: u64) {
 /// caller must fall back to treating everything as due.
 #[cfg(windows)]
 fn merge_into(ranges: &mut Vec<(u64, u64)>, base: u64, len: u64) -> bool {
-    if ranges.len() >= KEPT_RANGES {
-        return true;
-    }
     let mut out = Vec::with_capacity(ranges.len() + 1);
     let (mut start, mut end) = (base, base.saturating_add(len));
     let mut put = false;
@@ -2164,6 +2182,9 @@ fn merge_into(ranges: &mut Vec<(u64, u64)>, base: u64, len: u64) -> bool {
     }
     if !put {
         out.push((start, end - start));
+    }
+    if out.len() > KEPT_RANGES {
+        return true;
     }
     *ranges = out;
     false
@@ -2942,6 +2963,7 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension != BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        crate::texback::replaced(resource.data() as usize);
         textures().insert(at);
         if !fills(&desc) {
             TARGETS_AT
@@ -2967,7 +2989,9 @@ impl Drop for Resource {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let address = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::texback::released(address);
+            textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
@@ -3643,11 +3667,20 @@ mod tests {
     /// source that does not exist only ever adds a reason to let the host
     /// copy go, never a reason to keep it.
     #[test]
+    fn small_adapter_texture_floor_is_bounded_by_its_budget() {
+        assert_eq!(texture_floor(3 << 30), 1 << 30);
+        assert_eq!(texture_floor(6 << 30), 2 << 30);
+        assert_eq!(texture_floor(12 << 30), 2 << 30);
+    }
+
+    #[test]
     fn unmapped_ranges_fall_back_to_everything_past_the_cap() {
         let mut r = Vec::new();
         for i in 0..KEPT_RANGES as u64 {
             assert!(!merge_into(&mut r, i * 1024, 16), "range {i} fits");
         }
+        assert_eq!(r.len(), KEPT_RANGES);
+        assert!(!merge_into(&mut r, 1, 1), "an overlapping range does not exceed the cap");
         assert_eq!(r.len(), KEPT_RANGES);
         assert!(merge_into(&mut r, 1 << 40, 16), "one range past the cap must say so");
         // A range that only extends one already there is not a new one, so

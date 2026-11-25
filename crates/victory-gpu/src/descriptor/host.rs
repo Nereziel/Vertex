@@ -3139,7 +3139,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return !typeless && (!unordered || typed_store(own));
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
@@ -3147,7 +3147,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         if let Some(format) = format {
             *format = d.Format;
         }
-        return true;
+        return !unordered || typed_store(own);
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
@@ -3158,7 +3158,40 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     {
         *format = d.Format;
     }
-    true
+    !unordered || typed_store(if typeless { view } else { own })
+}
+
+/// A typed UAV must be writable on the actual host adapter. Cache the
+/// per-format capability instead of asking on every descriptor creation.
+fn typed_store(format: u32) -> bool {
+    static SUPPORT: std::sync::OnceLock<Mutex<std::collections::HashMap<u32, bool>>> =
+        std::sync::OnceLock::new();
+    let mut formats = SUPPORT.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&supported) = formats.get(&format) {
+        return supported;
+    }
+    let Some(host) = host() else { return false };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: the feature query writes only our own format-support structure.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    };
+    let supported = asked.is_ok()
+        && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+        && support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0;
+    if !supported {
+        tracing::warn!(format, "host does not support typed UAV stores; leaving view null");
+    }
+    formats.insert(format, supported);
+    supported
 }
 
 /// The title's unordered access view of a depth texture, as a view of the

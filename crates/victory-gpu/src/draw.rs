@@ -2476,6 +2476,9 @@ impl State {
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(crate::pipeline::builder_why());
+            #[cfg(not(feature = "diagnostics"))]
             crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
             #[cfg(feature = "diagnostics")]
             self.list_dropped_roots([x, y, z]);
@@ -3453,6 +3456,8 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(crate::pipeline::builder_why());
             return false;
         }
         // A program that walks ray-tracing structures nothing has built:
@@ -4258,15 +4263,6 @@ mod dispatch_tests {
         );
         // Zero threads along any axis is a no-op.
         assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
-    }
-}
-
-/// The view of no target, in a target's place.
-fn null_target() -> D3D12_RENDER_TARGET_VIEW_DESC {
-    D3D12_RENDER_TARGET_VIEW_DESC {
-        Format: DXGI_FORMAT(28),
-        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
-        ..Default::default()
     }
 }
 

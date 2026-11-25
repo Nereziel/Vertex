@@ -1048,11 +1048,21 @@ fn protect_aliases(g: &mut Guards, block: usize) {
     }
     #[cfg(feature = "diagnostics")]
     ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    for alias in shown {
-        let alias = alias / BLOCK;
+    let mut all_guarded = g.protected.contains(&block);
+    for &address in &shown {
+        let alias = address / BLOCK;
         g.aliased.insert(alias);
         if alias != block {
-            protect_alias(g, alias);
+            all_guarded &= protect_alias(g, alias);
+        }
+    }
+    if !all_guarded {
+        // An unprotected alias can change the physical page without a
+        // fault. Never answer "clean" for any view of that page until
+        // protection can be established on every view.
+        g.clean.remove(block);
+        for address in shown {
+            g.clean.remove(address / BLOCK);
         }
     }
 }
@@ -1081,10 +1091,10 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// reports a block that is read-only and not clean as written, then notes it
 /// clean). A block that is clean stays so: had the pages been written since
 /// its copies took them, `open` would have opened it.
-fn protect_alias(g: &mut Guards, block: usize) {
+fn protect_alias(g: &mut Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     if g.protected.contains(&block) {
-        return;
+        return true;
     }
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
@@ -1093,6 +1103,9 @@ fn protect_alias(g: &mut Guards, block: usize) {
         if view_known() {
             g.viewed.insert(block);
         }
+        true
+    } else {
+        false
     }
 }
 
@@ -1771,6 +1784,10 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
+    // The resource sweep consumes these ranges only when its early-remap
+    // policy is requested. Both mapping and unmapping invalidate old bytes.
+    crate::resource::note_unmapped(at as u64, len as u64);
     crate::stamp::advance();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
@@ -2316,6 +2333,26 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A failed VirtualProtect on another view must not make a physical
+    /// page clean through the views that could be guarded.
+    #[test]
+    fn a_page_with_an_unprotectable_alias_stays_dirty() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
+        let (section, one, two) = two_views(BLOCK);
+        // Reserve, but do not commit, an address so VirtualProtect fails.
+        // SAFETY: an independent reservation, released below.
+        let absent = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(absent, 0);
+        crate::inplace::title_memory_view(absent, BLOCK, section, 0);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]),
+            "the other alias is not protected");
+        title_memory_remapped(absent, BLOCK);
+        // SAFETY: the reservation created above.
+        unsafe { VirtualFree(absent as *mut _, 0, MEM_RELEASE) };
+        drop_views(section, &[one, two], BLOCK);
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the
