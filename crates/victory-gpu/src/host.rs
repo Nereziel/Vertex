@@ -4588,18 +4588,12 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
-        for (shadow, ranges) in &declared {
-            let mut sorted = ranges.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
-                }
-            }
+        // The declaration list is no longer needed after this loop.
+        // Consume its vectors and merge in place, rather than cloning
+        // and allocating another vector for the same exact spans.
+        for (shadow, ranges) in declared {
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
-            for (from, to) in spans {
+            for (from, to) in crate::shadow::joined(ranges) {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };

@@ -492,16 +492,22 @@ fn sent_over(ranges: &[(usize, usize)], from: usize, to: usize) -> &[(usize, usi
 }
 
 /// Ranges in order, those that overlap or touch as one.
-fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+pub(crate) fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    // Compact the sorted input in its existing allocation. The written
+    // prefix never reaches beyond the current input index.
+    let mut kept = 0;
+    for i in 0..ranges.len() {
+        let (from, to) = ranges[i];
+        if kept > 0 && from <= ranges[kept - 1].1 {
+            ranges[kept - 1].1 = ranges[kept - 1].1.max(to);
+        } else {
+            ranges[kept] = (from, to);
+            kept += 1;
         }
     }
-    out
+    ranges.truncate(kept);
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -511,17 +517,20 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// so a piece that held several ranges was hashed once for each.
 pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
     runs.sort_unstable_by_key(|r| r.first);
-    let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
-    for run in runs {
-        match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
-                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
-                last.to = last.to.max(run.to);
-            }
-            _ => out.push(run),
+    let mut kept = 0;
+    for i in 0..runs.len() {
+        let run = runs[i];
+        if kept > 0 && run.first <= runs[kept - 1].first + runs[kept - 1].pieces {
+            let last = &mut runs[kept - 1];
+            last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+            last.to = last.to.max(run.to);
+        } else {
+            runs[kept] = run;
+            kept += 1;
         }
     }
-    out
+    runs.truncate(kept);
+    runs
 }
 
 /// A declared range of a copy in the card's memory, as the compare on the
@@ -721,6 +730,27 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn joined_ranges_reuse_storage_and_keep_exact_coverage() {
+        // Exhaust all subsets of a small set of overlapping, adjacent,
+        // duplicate and disjoint ranges in reverse input order.
+        let cases = [(0, 2), (1, 3), (3, 5), (7, 8), (0, 2), (9, 12), (4, 10), (12, 13)];
+        for mask in 0..(1 << cases.len()) {
+            let mut input: Vec<_> = cases.iter().enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, &r)| r).rev().collect();
+            let mut want: Vec<_> = input.iter().flat_map(|&(a, b)| a..b).collect();
+            want.sort_unstable();
+            want.dedup();
+            input.reserve(16);
+            let ptr = input.as_ptr();
+            let got = joined(input);
+            assert_eq!(got.as_ptr(), ptr);
+            assert!(got.windows(2).all(|w| w[0].1 < w[1].0));
+            assert_eq!(got.iter().flat_map(|&(a, b)| a..b).collect::<Vec<_>>(), want);
+        }
     }
 }
 
