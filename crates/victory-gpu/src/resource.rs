@@ -1544,9 +1544,33 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// The guaranteed texture allowance, smaller on low-budget adapters if
+/// adaptive mode is selected. No query result (or a zero budget) retains
+/// the baseline floor.
+#[cfg(windows)]
+fn texture_floor(budget: Option<u64>) -> u64 {
+    const FLOOR: u64 = 2 << 30;
+    budget.filter(|&b| b > 0).map_or(FLOOR, |b| FLOOR.min(b / 3))
+}
+
+#[cfg(all(windows, test))]
+mod texture_floor_tests {
+    use super::texture_floor;
+
+    #[test]
+    fn adaptive_floor_is_capped_and_preserves_the_fallback() {
+        assert_eq!(texture_floor(None), 2 << 30);
+        assert_eq!(texture_floor(Some(0)), 2 << 30);
+        assert_eq!(texture_floor(Some(3 << 30)), 1 << 30);
+        assert_eq!(texture_floor(Some(6 << 30)), 2 << 30);
+        assert_eq!(texture_floor(Some(12 << 30)), 2 << 30);
+    }
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
+/// up to 2 GiB of them (at most one third of the initial DXGI budget with
+/// `VICTORY_ADAPTIVE_TEXTURE_FLOOR=1`), beyond that while the card's memory in use
 /// by this process is under nine tenths of the budget the system gives it
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
@@ -1554,7 +1578,6 @@ pub(crate) fn host_made<'a>(
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -1567,7 +1590,24 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    if filled < FLOOR {
+    // Keep the known-good policy unless explicitly asked. Cache only
+    // the initial allowance, not the live usage/budget decision below.
+    // Do not query the adapter on every descriptor or texture admission.
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let floor = *FLOOR.get_or_init(|| {
+        let adaptive = std::env::var_os("VICTORY_ADAPTIVE_TEXTURE_FLOOR").is_some_and(|v| v == "1");
+        let budget = if adaptive {
+            crate::host::host().and_then(|h| h.video_memory()).map(|v| v[0])
+        } else {
+            None
+        };
+        let floor = texture_floor(budget);
+        if adaptive {
+            tracing::info!(?budget, floor_mb = floor >> 20, "adaptive initial texture floor");
+        }
+        floor
+    });
+    if filled < floor {
         return true;
     }
     // Placed textures nothing holds any more give their ranges back here
