@@ -285,6 +285,34 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out
 }
 
+/// The byte bound for the GPU's 16-byte hash loads. The allocation is
+/// aligned and never smaller than the title range.
+fn card_hash_len(len: u64, size: u64, short: bool) -> u64 {
+    if short {
+        len.saturating_add(15).min(size) & !15
+    } else {
+        size
+    }
+}
+
+#[cfg(test)]
+mod card_hash_len_tests {
+    use super::card_hash_len;
+
+    #[test]
+    fn short_hash_bound_covers_every_title_byte_but_not_padding() {
+        for len in [1u64, 15, 16, 17, 288, 65535, 65536, 65537, 1048575] {
+            let size = len.next_multiple_of(65536);
+            let hashed = card_hash_len(len, size, true);
+            assert!(hashed >= len && hashed <= size && hashed - len < 16);
+            assert_eq!(hashed % 16, 0);
+            assert_eq!(card_hash_len(len, size, false), size);
+        }
+        assert_eq!(card_hash_len(288, 65536, true), 288);
+        assert_eq!(card_hash_len(0, 65536, true), 0);
+    }
+}
+
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
 /// for each 64 KiB piece (a copy that does not start on a piece boundary
 /// has one piece more).
@@ -4004,6 +4032,18 @@ impl Shadow {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
         Some((&card.staging, before, card.size))
+    }
+
+    /// Bytes hashed by both the before and after passes. Padding beyond the
+    /// title buffer is never fetched into title memory. Keep the original
+    /// full allocation by default; opt in to the shorter 16-byte-aligned
+    /// bound. Fetches, allocation sizes and piece numbering stay unchanged.
+    pub(crate) fn card_hashed(&self) -> Option<u64> {
+        static SHORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let size = self.card.as_ref()?.size;
+        Some(card_hash_len(self.len, size, *SHORT.get_or_init(|| {
+            std::env::var_os("VICTORY_CARD_HASH_LEN").is_some_and(|v| v == "1")
+        })))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes

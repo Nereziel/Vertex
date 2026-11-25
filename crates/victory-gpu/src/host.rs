@@ -4560,7 +4560,7 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            dispatch_card_compare(list, run.first, run.skew, size as u32, run.pieces, 0, 0);
+                            dispatch_card_compare(list, run.first, run.skew, shadow.card_hashed().unwrap_or(size) as u32, run.pieces, 0, 0);
                         }
                     }
                     crate::cardmeter::end(list, timed);
@@ -4658,7 +4658,7 @@ impl Host {
                             list,
                             r.span.first,
                             r.span.skew,
-                            size as u32,
+                            r.shadow.card_hashed().unwrap_or(size) as u32,
                             r.span.pieces,
                             r.at * 4,
                             if flown { 2 } else { 1 },
