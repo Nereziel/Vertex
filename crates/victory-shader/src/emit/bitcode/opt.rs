@@ -55,11 +55,7 @@ pub const FIRST: u32 = 32;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const WIDE: u32 = 64;
-/// All supported optimisation bits.
-pub const ALL: u32 = DEFAULT | WIDE;
-/// The baseline passes; wide table loads are experimental.
-pub const DEFAULT: u32 = MODULE | FIRST;
+pub const ALL: u32 = MODULE | FIRST;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
