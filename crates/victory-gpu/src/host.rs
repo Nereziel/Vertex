@@ -2686,15 +2686,7 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
-    ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
-        }
-    }
-    *ranges = out;
+    *ranges = crate::shadow::joined(std::mem::take(ranges));
 }
 
 /// Whether anything is in the air.
@@ -3860,26 +3852,70 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
 }
 
+/// Group ranges by copy identity, retaining first-seen copy order and
+/// first-seen range order. Only exact duplicate ranges are dropped.
+/// The index avoids a linear scan of all earlier copies per GPU write.
+struct WriteGroups<C> {
+    groups: Vec<(C, Vec<(usize, usize)>)>,
+    index: std::collections::HashMap<usize, usize>,
+}
+
+impl<C: Clone> WriteGroups<C> {
+    fn new() -> Self {
+        Self { groups: Vec::new(), index: std::collections::HashMap::new() }
+    }
+
+    fn push(&mut self, key: usize, copy: &C, range: (usize, usize)) {
+        match self.index.entry(key) {
+            std::collections::hash_map::Entry::Occupied(at) => {
+                let ranges = &mut self.groups[*at.get()].1;
+                if !ranges.contains(&range) {
+                    ranges.push(range);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(at) => {
+                at.insert(self.groups.len());
+                self.groups.push((copy.clone(), vec![range]));
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<(C, Vec<(usize, usize)>)> {
+        self.groups
+    }
+}
+
+#[cfg(test)]
+mod write_group_tests {
+    use super::WriteGroups;
+
+    #[test]
+    fn groups_keep_first_seen_order_and_only_remove_exact_duplicates() {
+        let mut groups = WriteGroups::new();
+        for (key, range) in [(8, (4, 8)), (1, (0, 2)), (8, (4, 8)), (8, (6, 9)), (1, (2, 4)), (3, (5, 6))] {
+            groups.push(key, &key, range);
+        }
+        assert_eq!(groups.finish(), vec![
+            (8, vec![(4, 8), (6, 9)]),
+            (1, vec![(0, 2), (2, 4)]),
+            (3, vec![(5, 6)]),
+        ]);
+    }
+}
+
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut back: Vec<Declared> = Vec::new();
+    let mut back = WriteGroups::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                    }
-                    None => back.push((shadow.clone(), vec![range])),
-                }
+                back.push(std::sync::Arc::as_ptr(shadow) as usize, shadow, range);
             }
         }
     }
-    back
+    back.finish()
 }
 
 /// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
@@ -4372,7 +4408,7 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        let mut declared = WriteGroups::new();
         // Ranges to fetch whether or not this submission writes them.
         let mut owed: Vec<(Arc<crate::shadow::Shadow>, (usize, usize))> = Vec::new();
         for list in runs {
@@ -4381,17 +4417,11 @@ impl Host {
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
+                    declared.push(Arc::as_ptr(shadow) as usize, shadow, range);
                 }
             }
         }
+        let mut declared = declared.finish();
         // Experiment (`VICTORY_SKIP_WC_COMPARE=1`): copies of write-combining
         // title memory are left out of the hashing and the compare; nothing
         // of them is fetched back. Pending ranges are still closed by the
