@@ -23,7 +23,7 @@ function Read-Choices {
     try {
         $read = Get-Content -LiteralPath $store -Raw -ErrorAction Stop | ConvertFrom-Json
         if ($read.GameExe) { $choices.GameExe = [string]$read.GameExe }
-        if ($read.Work -in 'cpu', 'balanced', 'gpu') { $choices.Work = [string]$read.Work }
+        if ($read.Work -in 'cpu', 'balanced', 'gpu', 'auto') { $choices.Work = [string]$read.Work }
         $choices.Lossless = [bool]$read.Lossless
         # (A LoopLimit an earlier launcher kept there is left out on purpose:
         # it cut compute loops short.)
@@ -85,8 +85,8 @@ $browse = Add-Control (New-Object System.Windows.Forms.Button) 454 34 90 27 'Bro
 $null = Add-Control (New-Object System.Windows.Forms.Label) 16 77 70 20 'Work split:'
 $work = Add-Control (New-Object System.Windows.Forms.ComboBox) 90 73 226 24
 $work.DropDownStyle = 'DropDownList'
-$works = 'cpu', 'balanced', 'gpu'
-$work.Items.AddRange(@('Processor (saves card memory)', 'Balanced', 'Graphics card (more memory)'))
+$works = 'cpu', 'balanced', 'gpu', 'auto'
+$work.Items.AddRange(@('Processor (saves card memory)', 'Balanced', 'Graphics card (more memory)', 'Auto (experimental)'))
 $work.SelectedIndex = [Array]::IndexOf($works, $choices.Work)
 $prebuild = Add-Control (New-Object System.Windows.Forms.Button) 330 70 214 30 'Pre-build shaders'
 $check = Add-Control (New-Object System.Windows.Forms.Button) 16 112 126 34 'Check this PC'
@@ -149,6 +149,8 @@ if ($SelfTest) {
     if ($form.Controls.Count -ne 12) { throw "controls: $($form.Controls.Count)" }
     $line = (Get-PlayArguments 'D:\a b\t.exe' 'gpu' $false) -join ' '
     if ($line -ne '-GameExe "D:\a b\t.exe" -Work gpu') { throw "play: $line" }
+    $line = (Get-PlayArguments 'D:\a b\t.exe' 'auto' $false) -join ' '
+    if ($line -ne '-GameExe "D:\a b\t.exe" -Work auto') { throw "auto: $line" }
     $line = (Get-PlayArguments 'D:\a b\t.exe' 'balanced' $true) -join ' '
     if ($line -ne '-GameExe "D:\a b\t.exe" -Prebuild') { throw "pre-build: $line" }
     $line = (Get-PlayArguments 'D:\a b\t.exe' 'balanced' $false $true) -join ' '

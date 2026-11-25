@@ -17,6 +17,9 @@ pub enum Work {
     /// changed bytes by its copy engine, more of the title's memory in its
     /// own. Takes card memory that textures would have.
     Gpu,
+    /// Experimental: balanced scheduling, exact SIMD comparisons, and
+    /// memory allowances selected from the actual host adapter's budget.
+    Auto,
 }
 
 /// What every choice has. The switches of soldsawn/victory-nvidia-8gb's
@@ -65,6 +68,17 @@ const GPU: &[(&str, &str)] = &[
     ("VICTORY_TEXTURE_DROP_MIPS", "1"),
 ];
 
+// Same base as Balanced. Do not change any translator settings, waits,
+// mip policy or queue mode. The budget-dependent decision is made in
+// victory-gpu after the actual adapter is known, not by guessing a GPU.
+const AUTO: &[(&str, &str)] = &[
+    ("VICTORY_QUEUE2", "1"),
+    ("VICTORY_TEXTURE_DROP_MIPS", "1"),
+    ("VICTORY_CHANGED_RUNS", "1"),
+    ("VICTORY_ADAPTIVE_TEXTURE_FLOOR", "1"),
+    ("VICTORY_AUTO_CARD_MIN", "1"),
+];
+
 impl Work {
     /// The settings of the choice, each name once.
     pub fn settings(self) -> impl Iterator<Item = (&'static str, &'static str)> {
@@ -72,6 +86,7 @@ impl Work {
             Work::Cpu => CPU,
             Work::Balanced => BALANCED,
             Work::Gpu => GPU,
+            Work::Auto => AUTO,
         };
         ALL.iter().chain(own).copied()
     }
@@ -97,7 +112,7 @@ mod tests {
 
     #[test]
     fn a_choice_names_each_setting_once() {
-        for work in [Work::Cpu, Work::Balanced, Work::Gpu] {
+        for work in [Work::Cpu, Work::Balanced, Work::Gpu, Work::Auto] {
             let mut names: Vec<_> = work.settings().map(|s| s.0).collect();
             let all = names.len();
             names.sort_unstable();
@@ -105,6 +120,19 @@ mod tests {
             assert_eq!(names.len(), all, "{work:?}");
             assert!(names.iter().all(|n| n.starts_with("VICTORY_")));
         }
+    }
+
+    #[test]
+    fn auto_is_balanced_plus_only_the_runtime_switches() {
+        let balanced: Vec<_> = Work::Balanced.settings().collect();
+        let auto: Vec<_> = Work::Auto.settings().collect();
+        assert!(balanced.iter().all(|s| auto.contains(s)));
+        let extra: Vec<_> = auto.into_iter().filter(|s| !balanced.contains(s)).collect();
+        assert_eq!(extra, [
+            ("VICTORY_CHANGED_RUNS", "1"),
+            ("VICTORY_ADAPTIVE_TEXTURE_FLOOR", "1"),
+            ("VICTORY_AUTO_CARD_MIN", "1"),
+        ]);
     }
 
     #[test]

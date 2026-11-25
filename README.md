@@ -125,7 +125,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 | `VICTORY_CARD_BUFFERS_MB`, `VICTORY_CARD_WINDOWS_MB` | how much of the title's memory is copied to the card (`VICTORY_CARD_WINDOWS_MB=0`: no windows) |
 | `VICTORY_SHADER_OPT=0` | no clean-up of translated shaders: try it if you see black blocks. Everything is translated again |
 | `VICTORY_BVH_BUILDER=1` | asks for ray tracing. Slow (about 4 fps), and not tested with the merged build apart from one run that hung |
-| `--work cpu`, `balanced`, `gpu` (`victory run`) | where work is done that both sides can do; `balanced` is the measured choice and the launcher's default |
+| `--work cpu`, `balanced`, `gpu`, `auto` (`victory run`) | where work is done that both sides can do; `balanced` remains the launcher's default. `auto` is experimental: balanced settings plus exact SIMD comparisons, adaptive texture floor and a 256 KiB card-buffer minimum when the initial DXGI local budget is at least 8 GiB. Existing manual overrides win; no translator switches are changed. |
 
 More switches are described in comments where the code reads them.
 

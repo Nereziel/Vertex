@@ -36,7 +36,8 @@
 
 .PARAMETER Work
   Where work is done that the processor and the graphics card can both do:
-  cpu (less on the card and less of its memory), balanced, gpu (more on it).
+  cpu (less on the card and less of its memory), balanced, gpu (more on it),
+  auto (experimental balanced profile with runtime memory tuning).
 
 .PARAMETER LosslessScaling
   Also start Lossless Scaling (a Steam application of its own, not part of
@@ -57,7 +58,7 @@ param(
     [string]$GameExe,
     [switch]$Install,
     [ValidateRange(0, 1048576)][int]$LoopLimit = 0,
-    [ValidateSet('cpu', 'balanced', 'gpu')][string]$Work = 'balanced',
+    [ValidateSet('cpu', 'balanced', 'gpu', 'auto')][string]$Work = 'balanced',
     [switch]$Prebuild,
     [switch]$PrebuildAll,
     [switch]$LosslessScaling,

@@ -162,10 +162,33 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// With the opt-in automatic profile, consider smaller GPU buffers only
+/// when the initial local budget leaves ample room. Unknown/small budgets
+/// retain the original minimum; never increase the total card allocation.
+fn auto_card_min(budget: Option<u64>) -> u64 {
+    if budget.is_some_and(|b| b >= 8 << 30) { 256 << 10 } else { 1 << 20 }
+}
+
+#[cfg(test)]
+mod auto_card_min_tests {
+    use super::auto_card_min;
+
+    #[test]
+    fn only_large_known_budgets_lower_the_minimum() {
+        assert_eq!(auto_card_min(None), 1 << 20);
+        assert_eq!(auto_card_min(Some(0)), 1 << 20);
+        assert_eq!(auto_card_min(Some((8 << 30) - 1)), 1 << 20);
+        assert_eq!(auto_card_min(Some(8 << 30)), 256 << 10);
+        assert_eq!(auto_card_min(Some(12 << 30)), 256 << 10);
+    }
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1024).
+/// `VICTORY_AUTO_CARD_MIN=1` uses 256 KiB from an initial local budget of
+/// 8 GiB, unless either minimum is set explicitly.
 /// `VICTORY_CARD_BUFFERS_MIN_KB` names the smallest in KiB instead, below
 /// 1 MiB too (0: every title buffer): run int-k-2's world has 3,604 title
 /// buffers under 1 MiB, 42 MB in all, that shaders read over the bus.
@@ -183,6 +206,15 @@ fn card_limits() -> (u64, u64) {
         // drawn in every run.
         let least = match std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
             Some(kb) => kb << 10,
+            None if std::env::var_os("VICTORY_CARD_BUFFERS_MIN_KB").is_none()
+                && std::env::var_os("VICTORY_CARD_BUFFERS_MIN_MB").is_none()
+                && std::env::var_os("VICTORY_AUTO_CARD_MIN").is_some_and(|v| v == "1") =>
+            {
+                let budget = host().and_then(|h| h.video_memory()).map(|v| v[0]);
+                let least = auto_card_min(budget);
+                tracing::info!(?budget, min_kb = least >> 10, "automatic initial GPU buffer minimum");
+                least
+            }
             None => mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20),
         };
         (least, mb("VICTORY_CARD_BUFFERS_MB", 1024))
