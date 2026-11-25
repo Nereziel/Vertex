@@ -39,7 +39,7 @@ or publisher.
 
 ### Getting started
 
-1. Get the code: `git clone https://github.com/proneonn/Vertex`
+1. Get the code: `git clone https://github.com/Nereziel/Vertex`
 2. Double-click `Launcher.cmd`. It finds your copy's executable, checks this
    PC, installs what is missing and starts the title.
 
@@ -109,7 +109,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 1. **Close other programs**, browsers first. With little memory free, freezes
    get longer.
 2. **Run twice.** The second start uses the shaders and pipelines of the first.
-3. **Try the faster submission settings:** `.\start.ps1 -GameExe <exe> -Tuned`
+3. **Try the balanced submission settings:** `.\start.ps1 -GameExe <exe> -Work balanced`
 4. **Change one setting at a time**, set before the start
    (`$env:NAME = 'value'`):
 
