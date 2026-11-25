@@ -4261,15 +4261,6 @@ mod dispatch_tests {
     }
 }
 
-/// The view of no target, in a target's place.
-fn null_target() -> D3D12_RENDER_TARGET_VIEW_DESC {
-    D3D12_RENDER_TARGET_VIEW_DESC {
-        Format: DXGI_FORMAT(28),
-        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
-        ..Default::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

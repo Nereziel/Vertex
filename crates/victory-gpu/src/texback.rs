@@ -142,6 +142,11 @@ impl Back {
     }
 }
 
+/// End of the full pitched footprint (including last-row padding).
+fn pitched_end(offset: u64, pitch: u32, rows: u32, depth: u32) -> Option<u64> {
+    offset.checked_add(u64::from(pitch).checked_mul(u64::from(rows))?.checked_mul(u64::from(depth))?)
+}
+
 /// Records a host copy from a texture already in COPY_SOURCE.
 pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option<Back> {
     if !target.ticket.valid.load(Ordering::Acquire) {
@@ -174,10 +179,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     // The tiler reads a pitched slice, so the mapped buffer must include it.
     for (footprint, &rows) in footprints.iter().zip(&rows) {
         let format = footprint.Footprint;
-        let pitched = u64::from(format.RowPitch)
-            .checked_mul(u64::from(rows))?
-            .checked_mul(u64::from(format.Depth))?;
-        total = total.max(footprint.Offset.checked_add(pitched)?);
+        total = total.max(pitched_end(footprint.Offset, format.RowPitch, rows, format.Depth)?);
     }
     let buffer = host.read_back_buffer(total)?;
     for (i, footprint) in footprints.iter().enumerate() {
@@ -259,6 +261,13 @@ pub(crate) fn land(back: &Back) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pitched_footprint_includes_last_row_padding_and_rejects_overflow() {
+        assert_eq!(pitched_end(512, 256, 3, 2), Some(2048));
+        assert_eq!(pitched_end(u64::MAX, 256, 1, 1), None);
+        assert_eq!(pitched_end(0, u32::MAX, u32::MAX, 2), None);
+    }
 
     #[test]
     fn only_readbacks_for_changed_allocations_are_invalidated() {
