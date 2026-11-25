@@ -4270,7 +4270,18 @@ fn lookup(
         let map = buffers_shared();
         let found = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end);
         match found {
-            Some((_, Entry { shadow: Some(shadow), .. })) => return Some((shadow.clone(), false)),
+            Some((_, Entry { shadow: Some(shadow), .. })) => {
+                let shadow = shadow.clone();
+                drop(map);
+                // A cached whole-buffer copy is not necessarily suitable
+                // for this view. Use the same alignment decision as on a
+                // cold lookup, or meshlet/vertex views may be left null
+                // depending on which descriptor was created first.
+                return Some(match exact_for(range, shadow.offset(address)) {
+                    Some(own) => (own, true),
+                    None => (shadow, false),
+                });
+            }
             // To be made: below, alone.
             Some(_) => {}
             None => {
@@ -4291,7 +4302,10 @@ fn lookup(
         return loose(address, end, len <= 1, any, range);
     };
     let entry = map.get_mut(&key)?;
-    if let Some(own) = exact_for(range, address - key.0) {
+    // Another thread may have populated the entry after the shared lookup.
+    // Use the actual offset if it did.
+    let offset = entry.shadow.as_ref().map_or(address - key.0, |shadow| shadow.offset(address));
+    if let Some(own) = exact_for(range, offset) {
         return Some((own, true));
     }
     if entry.shadow.is_none() {
@@ -4720,6 +4734,43 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+#[cfg(test)]
+mod exact_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn cached_registered_buffer_still_selects_exact_view_backing() {
+        if host().is_none() {
+            return;
+        }
+        // Only the GPU allocations are exercised; no title memory is read.
+        let storage = vec![0u8; 4096];
+        let base = storage.as_ptr() as u64;
+        let owner = base as usize;
+        let view = base + 4;
+        register(owner, base, 4096);
+        // Warm the ordinary copy first, as an earlier descriptor can do.
+        let whole = find(base, 4096);
+        let selected = find_or_exact(view, 32, |offset| {
+            (!offset.is_multiple_of(16)).then_some((view, 32))
+        });
+        let repeated = find_or_exact(view, 32, |offset| {
+            (!offset.is_multiple_of(16)).then_some((view, 32))
+        });
+        let plain = find_or_exact(view, 32, |_| None);
+        unregister(owner, base);
+        let whole = whole.expect("whole buffer");
+        let (own, exact) = selected.expect("unaligned view");
+        let (again, exact_again) = repeated.expect("repeated view");
+        let (plain, is_exact) = plain.expect("ordinary view");
+        assert!(exact && exact_again);
+        assert_eq!(own.span(), (view, 32));
+        assert!(Arc::ptr_eq(&own, &again));
+        assert!(!Arc::ptr_eq(&whole, &own));
+        assert!(!is_exact && Arc::ptr_eq(&whole, &plain));
+    }
 }
 
 #[cfg(test)]
