@@ -474,14 +474,16 @@ fn card_clock_watch(clock: &'static CardClock) {
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
-fn card_clock_line(frames: f64, ms: f64) {
+fn card_clock_line(frames: f64, ms: f64) -> f64 {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    let busy = if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 };
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
          had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
-        if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
+        busy
     );
+    busy
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -8324,6 +8326,37 @@ struct Presenter {
     meter: Meter,
 }
 
+/// Opt-in extended performance caption. These are submission timings and
+/// an estimate from our queue's clock, not system-wide CPU/GPU utilisation.
+fn perf_caption() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PERF_CAPTION").is_some_and(|v| v == "1"))
+}
+
+fn memory_caption(memory: Option<[u64; 4]>) -> String {
+    match memory {
+        Some([budget, used, _, shared]) => format!(
+            " | VRAM {:.2}/{:.2} GiB | shared {:.2} GiB",
+            used as f64 / (1u64 << 30) as f64,
+            budget as f64 / (1u64 << 30) as f64,
+            shared as f64 / (1u64 << 30) as f64
+        ),
+        None => " | VRAM n/a".into(),
+    }
+}
+
+#[cfg(test)]
+mod caption_tests {
+    use super::memory_caption;
+
+    #[test]
+    fn memory_caption_labels_budget_and_shared_memory() {
+        assert_eq!(memory_caption(Some([8 << 30, 6 << 30, 16 << 30, 1 << 29])),
+            " | VRAM 6.00/8.00 GiB | shared 0.50 GiB");
+        assert_eq!(memory_caption(None), " | VRAM n/a");
+    }
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
@@ -8422,7 +8455,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
-        card_clock_line(frames, ms);
+        let queue_busy = card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         if let Some(host) = host() {
@@ -8641,7 +8674,11 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | Vertex {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let mut text = format!(" | Vertex {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        if perf_caption() {
+            use std::fmt::Write;
+            let _ = write!(text, " | CPU prep {cpu:.1} ms | GPU queue ~{queue_busy:.0}% | back {back_ms:.1} ms | PSO pending {} | drops {dropped:.0}/frame", crate::pipeline::making());
+        }
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -8658,8 +8695,16 @@ impl Meter {
                         let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
                         match next {
                             // SAFETY: a window handle and a NUL-terminated text.
-                            Some((hwnd, text)) => unsafe {
-                                let _ = SetWindowTextW(HWND(hwnd as *mut _), PCWSTR(text.as_ptr()));
+                            Some((hwnd, mut text)) => {
+                                // DXGI memory sampling runs on this same helper,
+                                // not on the presenting thread. Keep one NUL.
+                                if perf_caption() {
+                                    text.pop();
+                                    text.extend(memory_caption(host().and_then(|h| h.video_memory())).encode_utf16());
+                                    text.push(0);
+                                }
+                                // SAFETY: a window handle and NUL-terminated text.
+                                unsafe { let _ = SetWindowTextW(HWND(hwnd as *mut _), PCWSTR(text.as_ptr())); }
                             },
                             None => std::thread::sleep(std::time::Duration::from_millis(100)),
                         }

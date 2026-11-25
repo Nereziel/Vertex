@@ -117,6 +117,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 |---|---|
 | `VICTORY_TEXTURE_SHARE=33` | the share of each frame, in percent, the texture pass may take. Lower: smoother, textures come in later. `0`: no limit, as before |
 | `VICTORY_TEXTURE_STAGE_MS=250` | the most that pass may take in any case, in ms (three times that with a large backlog) |
+| `VICTORY_PERF_CAPTION=1` | extended window title performance display: FPS, frame time, CPU submission preparation, estimated queue busy percentage, pending PSOs, drops and DXGI memory usage/budget. Updated once per second; not an in-frame overlay. Off by default. |
 | `VICTORY_ADAPTIVE_TEXTURE_FLOOR=1` | experimental: cap the unconditional texture allowance at one third of the initial DXGI local memory budget (never above 2 GiB); default off. The live usage checks and manual budget override remain unchanged. |
 | `VICTORY_TEXTURE_BUDGET_MB=<n>` | at most this much card memory for those textures: less pressure on memory, blurrier picture |
 | `VICTORY_CARD_HASH_LEN=1` | experimental: hash only title buffer bytes (rounded to 16 bytes), not allocation padding; off by default. Test with small card buffers separately. |
