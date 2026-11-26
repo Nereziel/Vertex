@@ -119,6 +119,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 | `VICTORY_TEXTURE_STAGE_MS=250` | the most that pass may take in any case, in ms (three times that with a large backlog) |
 | `VICTORY_TEXTURE_BUDGET_MB=<n>` | at most this much card memory for those textures: less pressure on memory, blurrier picture |
 | `VICTORY_CARD_BUFFERS_MB`, `VICTORY_CARD_WINDOWS_MB` | how much of the title's memory is copied to the card (`VICTORY_CARD_WINDOWS_MB=0`: no windows) |
+| `VICTORY_WATCH_APART=1` | experimental parallel WriteWatch queries for disjoint pages; off by default. Compare the same warm-cache scene with `0` and `1`; disable if geometry, textures or stability regress |
 | `VICTORY_SHADER_OPT=0` | no clean-up of translated shaders: try it if you see black blocks. Everything is translated again |
 | `VICTORY_BVH_BUILDER=1` | asks for ray tracing. Slow (about 4 fps), and not tested with the merged build apart from one run that hung |
 | `--work cpu`, `balanced`, `gpu` (`victory run`) | where work is done that both sides can do; `balanced` is the measured choice and the launcher's default |
