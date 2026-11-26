@@ -227,11 +227,10 @@ fn bury(finished: u64) {
         if retired.is_empty() {
             return;
         }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
-        *retired = keep;
-        done
+        // Retain the allocation and order of entries still in flight.
+        // Only completed entries move out, and their resources are still
+        // released outside the retirement lock.
+        retired.extract_if(.., |(at, _)| *at <= finished).collect()
     };
     drop(done);
 }
