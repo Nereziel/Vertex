@@ -3580,7 +3580,7 @@ fn relay_worker() {
                 }), completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
-                    let Some(Late::Run(flight)) = line.line.front() else {
+                    let Some(Late::Run(flight)) = line.line.first() else {
                         unreachable!("non-flight entries are always landable");
                     };
                     break Err(flight.fence);
