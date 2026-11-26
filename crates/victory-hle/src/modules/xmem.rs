@@ -467,16 +467,16 @@ impl Section {
         let Some(end) = start.checked_add(count) else {
             return false;
         };
-        (start..end).all(|page| {
-            (self.committed[page / 64].load(Ordering::Relaxed) >> (page % 64)) & 1 != 0
+        commit_words(start, end).all(|(word, mask)| {
+            self.committed[word].load(Ordering::Relaxed) & mask == mask
         })
     }
 
     /// Records pages `[start, start + count)` as committed in the persistent
     /// view. A lost race only costs a call, so relaxed is enough.
     fn mark_committed(&self, start: usize, count: usize) {
-        for page in start..start + count {
-            self.committed[page / 64].fetch_or(1u64 << (page % 64), Ordering::Relaxed);
+        for (word, mask) in commit_words(start, start + count) {
+            self.committed[word].fetch_or(mask, Ordering::Relaxed);
         }
     }
 
@@ -524,6 +524,19 @@ impl Section {
         self.mark_committed(start_page, count);
         true
     }
+}
+
+/// One mask per affected bitmap word (exclusive end); never shifts by 64.
+fn commit_words(start: usize, end: usize) -> impl Iterator<Item = (usize, u64)> {
+    let first = start / 64;
+    let stop = if start < end { end.div_ceil(64) } else { first };
+    (first..stop).map(move |word| {
+        let lo = start.saturating_sub(word * 64).min(64);
+        let hi = end.saturating_sub(word * 64).min(64);
+        let low = u64::MAX << lo;
+        let high = u64::MAX >> (64 - hi);
+        (word, low & high)
+    })
 }
 
 /// The section's whole range, mapped once and unmapped when the section
@@ -2050,6 +2063,14 @@ mod tests {
         // guess, which is the direction that keeps a run on the proven path.
         let lone_surrogate = OsString::from_wide(&[0xd800]);
         assert!(!parse_persistent_views(Some(lone_surrogate.as_os_str())));
+    }
+
+    #[test]
+    fn commit_masks_cover_exactly_the_requested_pages() {
+        assert_eq!(commit_words(64, 64).count(), 0);
+        assert_eq!(commit_words(0, 64).collect::<Vec<_>>(), [(0, u64::MAX)]);
+        assert_eq!(commit_words(63, 65).collect::<Vec<_>>(), [(0, 1 << 63), (1, 1)]);
+        assert_eq!(commit_words(65, 130).collect::<Vec<_>>(), [(1, u64::MAX << 1), (2, 3)]);
     }
 
     /// A write through the section's one persistent view lands in its pages,
