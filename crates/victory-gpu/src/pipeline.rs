@@ -825,7 +825,14 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let builder = of_builder(&shaders);
+    #[cfg(windows)]
+    let host = if builder {
+        // The BVH builder tracks its own stages and their lifetimes.
+        Arc::new(make::Pending::new(shaders.clone(), graphics))
+    } else {
+        make::Pending::shared(shaders.clone(), graphics)
+    };
     // A skipped pipeline is not started early either: its draws never ask
     // for it, and its compile can be why it is skipped (one the driver's
     // compiler never finishes grows the process until it runs out).
@@ -837,8 +844,6 @@ fn hand_out(
     if !skipped {
         make::early(&host);
     }
-    #[cfg(windows)]
-    let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
