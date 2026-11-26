@@ -1767,11 +1767,21 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
+        self.release_locked(first, n, &mut guard);
+    }
+
+    /// On the relay thread never wait for a lock a submitting thread
+    /// might hold while waiting for the relay itself.
+    pub(crate) fn try_release(&self, first: u32, n: u32) -> bool {
+        let Ok(mut guard) = self.next.try_lock() else { return false; };
+        self.release_locked(first, n, &mut guard);
+        true
+    }
+
+    fn release_locked(&self, first: u32, n: u32, guard: &mut (u32, Vec<bool>)) {
+        let Some(at) = first.checked_sub(self.count) else { return; };
+        let end = at.saturating_add(n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             let given = slots.iter().filter(|taken| **taken).count() as u32;
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
