@@ -144,10 +144,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File {
-        file,
-        trace_name: (walls_trace() != 0).then_some(name),
-    });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    if walls_trace() != 0 {
+        WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).insert(file as usize, name);
+    }
     put(out, file)
 }
 
@@ -262,13 +262,25 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
-    trace_name: Option<String>,
+}
+
+extern "system" fn release_file(this: *mut Instance<File>) -> u32 {
+    // SAFETY: our live file object; remove the diagnostic entry before its
+    // address can be reused by another allocation.
+    let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
+        if walls_trace() != 0 {
+            WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).remove(&(this as usize));
+        }
+        drop(unsafe { Box::from_raw(this) });
+    }
+    left
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<File> as *const (),
-    release::<File> as *const (),
+    release_file as *const (),
     missing::<3> as *const (),
     missing::<4> as *const (),
     missing::<5> as *const (),
@@ -468,6 +480,10 @@ fn walls_trace() -> u8 {
     })
 }
 
+// Diagnostic only; no allocation or registry lock with the trace off.
+static WALLS_FILES: std::sync::LazyLock<Mutex<HashMap<usize, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// The walls trace's line for a request that is done.
 fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
     let level = walls_trace();
@@ -477,9 +493,8 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     let file = if request.options & MEMORY_SOURCE != 0 {
         "memory".to_string()
     } else {
-        // SAFETY: the request keeps the file object alive until completion.
-        unsafe { request.source.cast::<Instance<File>>().as_ref() }
-            .and_then(|f| f.state.trace_name.clone()).unwrap_or_else(|| "?".to_string())
+        WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner())
+            .get(&(request.source as usize)).cloned().unwrap_or_else(|| "?".to_string())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -1274,66 +1289,66 @@ fn into_destination(
         return filled;
     }
     scratch(Scratch::Destination, len, |data| {
-    let n = fill(data)?;
-    // A page the title has just made, or a view the host refuses for a
-    // moment, comes right a little later: the write is tried again before
-    // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
-    // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
-    // reads a launch here, all in one second of the loading; the one build
-    // that tried again (run 165) lost none of 13.
-    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
-    });
-    // Since the start: writes that succeeded on a later try, and writes
-    // given up.
-    static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    let write = || runs.is_some_and(|runs| runs.write(&data[..n]));
-    let mut written = write();
-    let mut tries = 0u32;
-    while !written && runs.is_some() && tries < retries {
-        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
-        tries += 1;
-        written = write();
-    }
-    if written {
-        if tries > 0 {
-            let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::info!(
+        let n = fill(data)?;
+        // A page the title has just made, or a view the host refuses for a
+        // moment, comes right a little later: the write is tried again before
+        // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
+        // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
+        // reads a launch here, all in one second of the loading; the one build
+        // that tried again (run 165) lost none of 13.
+        static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let retries = *RETRIES.get_or_init(|| {
+            std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
+        });
+        // Since the start: writes that succeeded on a later try, and writes
+        // given up.
+        static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        let write = || runs.is_some_and(|runs| runs.write(&data[..n]));
+        let mut written = write();
+        let mut tries = 0u32;
+        while !written && runs.is_some() && tries < retries {
+            std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+            tries += 1;
+            written = write();
+        }
+        if written {
+            if tries > 0 {
+                let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::info!(
+                    offset,
+                    len,
+                    tries,
+                    on_a_retry,
+                    given_up = RETRIED[1].load(Ordering::Relaxed),
+                    "dstorage: a destination's physical pages written after a retry"
+                );
+            }
+            // As above, after the write that succeeded.
+            if let Some(runs) = runs {
+                runs.written(n);
+            }
+            Ok(())
+        } else {
+            let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                known = runs.is_some(),
+                last_error = std::io::Error::last_os_error().raw_os_error(),
+                tries,
+                given_up,
+                on_a_retry = RETRIED[0].load(Ordering::Relaxed),
+                "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
+            );
+            // Said aloud: the title never reads a request's result
+            // (it only polls for completion), so a destination left unwritten
+            // is a model or texture that silently holds whatever its pages
+            // held before.
+            tracing::warn!(
                 offset,
                 len,
-                tries,
-                on_a_retry,
-                given_up = RETRIED[1].load(Ordering::Relaxed),
-                "dstorage: a destination's physical pages written after a retry"
+                "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
             );
+            Err(E_INVALIDARG)
         }
-        // As above, after the write that succeeded.
-        if let Some(runs) = runs {
-            runs.written(n);
-        }
-        Ok(())
-    } else {
-        let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::warn!(
-            known = runs.is_some(),
-            last_error = std::io::Error::last_os_error().raw_os_error(),
-            tries,
-            given_up,
-            on_a_retry = RETRIED[0].load(Ordering::Relaxed),
-            "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
-        );
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
-    }
     })
 }
 
@@ -1364,6 +1379,35 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dstorage_worker_count_keeps_defaults_and_clamps_overrides() {
+        assert_eq!(worker_count(16, None), 16);
+        assert_eq!(worker_count(16, Some("6")), 6);
+        assert_eq!(worker_count(16, Some("100")), 16);
+        assert_eq!(worker_count(16, Some("0")), 16);
+        assert_eq!(worker_count(16, Some("bad")), 16);
+        assert_eq!(worker_count(0, None), 1);
+    }
+
+    #[test]
+    fn scratch_stages_are_independent_and_zeroed_on_reuse() {
+        scratch(Scratch::Source, 128, |source| {
+            source.fill(0xaa);
+            scratch(Scratch::Packed, 128, |packed| {
+                packed.fill(0xbb);
+                scratch(Scratch::Destination, 128, |dest| {
+                    assert!(dest.iter().all(|&v| v == 0));
+                    dest.fill(0xcc);
+                });
+                assert!(packed.iter().all(|&v| v == 0xbb));
+            });
+            assert!(source.iter().all(|&v| v == 0xaa));
+        });
+        for kind in [Scratch::Source, Scratch::Packed, Scratch::Destination] {
+            scratch(kind, 128, |bytes| assert!(bytes.iter().all(|&v| v == 0)));
+        }
+    }
+
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
