@@ -1274,6 +1274,22 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (start, end) = reach(&physical, to, len);
     let _changing = victory_gpu::title_memory_remapping(start, end - start);
     unmap(&mut physical, to, len);
+    // The GPU's mapping copies are frequently many single pages. Only
+    // parallelise when every source is already mapped and no destination
+    // can change a source. Overlapping alias moves retain list order.
+    if map_workers() > 1 && from != 0 && len / PAGE >= 8
+        && len % PAGE == 0 && to % PAGE == 0 && from % PAGE == 0
+        && to.checked_add(len).zip(from.checked_add(len))
+            .is_some_and(|(te, fe)| te <= from || fe <= to)
+    {
+        let runs: Option<Vec<_>> = (0..len).step_by(PAGE).map(|k| {
+            let (slice, index) = mapped_slice(&physical, from + k)?;
+            Some((to + k, PAGE, Slice { section: slice.section.clone(), index }))
+        }).collect();
+        if let Some(runs) = runs {
+            return map_runs_parallel(&mut physical, &runs);
+        }
+    }
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
