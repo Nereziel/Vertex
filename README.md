@@ -136,6 +136,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 | `VICTORY_DSTORAGE_WORKERS=<n>` | limit the existing parallel read/decode pool to at most this many logical processors; unset uses all available processors. Try fewer workers if rendering threads are starved |
 | `VICTORY_XMEM_SKIP_SAME=1` | skip remapping only when the known section and offset match on every requested page; experimental, may save nothing if mappings rarely repeat |
 | `VICTORY_QUEUE2=3` | use both existing copy lanes (readback and upload); default `1` is readback only; `0` disables both |
+| `VICTORY_MAP_THREADS=2` (1–4) | experimental parallel mapping of independent physical runs and nonoverlapping GPU aliases; default 1. Placeholder splits and tracking remain serial; try 2 before 4 |
 | `VICTORY_TEXTURE_ADAPTIVE=1` | limit the foreground texture pass based on backlog and the observed interval between passes; background worker gets a longer slice; not a GPU utilisation measurement |
 | `VICTORY_SKIP_STATE_CALLS=1` | omit identical blend, stencil and depth bounds values within one command list; experimental |
 | `VICTORY_ASYNC_SUBMIT=1` | prepare and submit on the existing submission worker; falls back if the worker cannot start |
@@ -319,3 +320,11 @@ title's data folder.
 - Developed with [Claude Code](https://claude.com/claude-code).
 
 GPL-3.0-or-later. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+
+### Vice-Tay / 7900XTX / Neptune P0 integration notes
+
+- Vice-Tay `565f4a5` inspired the bounded parallel mapping experiment. Vertex does not yet parallelise arbitrary scatter lists. The experiment is deliberately independent of `-PerformanceLab`; benchmark `VICTORY_MAP_THREADS=1`, `2`, and `4` on the same save.
+- The relay returns completed dynamic descriptor slots before recycling detached lists, using nonblocking locks. Contended ranges are released by the ordinary destructor.
+- Indirect argument gathering now stops at buffer copies and explicit synchronization boundaries (inspired by Vice-Tay `0375962`). This preserves the existing window/gather algorithm; it is not a port of the new batched clamp renderer.
+- `PLACED_ORDER`, the thin command-list recorder, and texture uploads on a dedicated copy queue are not yet integrated. Their upstream implementations depend on a different command ordering and resource lifetime architecture. The existing buffer copy queues, async submission, and texture worker remain available, but are not equivalent to those features.
+- No Windows build or gameplay benchmark has validated this integration yet.
