@@ -108,12 +108,11 @@ struct Landing {
 /// Which landing buffer (its size, and the fence value it is held until)
 /// takes `bytes` when the host's fence has reached `completed`: the
 /// smallest free one that holds them.
-fn pick_landing(landings: &[(u64, u64)], bytes: u64, completed: u64) -> Option<usize> {
+fn pick_landing(landings: impl Iterator<Item = (u64, u64)>, bytes: u64, completed: u64) -> Option<usize> {
     landings
-        .iter()
         .enumerate()
-        .filter(|&(_, &(size, until))| until <= completed && size >= bytes)
-        .min_by_key(|&(_, &(size, _))| size)
+        .filter(|&(_, (size, until))| until <= completed && size >= bytes)
+        .min_by_key(|&(_, (size, _))| size)
         .map(|(at, _)| at)
 }
 
@@ -405,19 +404,24 @@ impl Second {
     /// way.
     pub(crate) fn landing(&self, bytes: u64, completed: u64, until: u64) -> Option<ID3D12Resource> {
         let mut landings = lock(&self.landings);
-        let sizes: Vec<(u64, u64)> = landings.iter().map(|l| (l.size, l.until)).collect();
-        if let Some(at) = pick_landing(&sizes, bytes, completed) {
+        if let Some(at) = pick_landing(landings.iter().map(|l| (l.size, l.until)), bytes, completed) {
             landings[at].until = until;
             return Some(landings[at].buffer.clone());
         }
         // A new one; free ones that are too small make room for it (the
         // card has passed their last use: nothing names them).
-        let size = bytes.next_multiple_of(1 << 20);
+        let size = bytes.checked_next_multiple_of(1 << 20)?;
         let alive = |landings: &[Landing]| landings.iter().map(|l| l.size).sum::<u64>();
-        if alive(&landings) + size > landing_most() {
+        // An oversized transfer will fall back to the direct queue. Do
+        // not evict otherwise useful idle buffers merely to discover that.
+        if size > landing_most() {
+            self.landing[1].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if alive(&landings).saturating_add(size) > landing_most() {
             landings.retain(|l| l.until > completed);
         }
-        let made = if alive(&landings) + size > landing_most() {
+        let made = if alive(&landings).saturating_add(size) > landing_most() {
             None
         } else {
             let heap = D3D12_HEAP_PROPERTIES {
@@ -622,16 +626,16 @@ mod tests {
         // (size, held until this value of the host's fence)
         let landings = [(4 << 20, 10), (1 << 20, 12), (2 << 20, 7), (8 << 20, 7)];
         // The card is at 9: the third and fourth are free.
-        assert_eq!(pick_landing(&landings, 1 << 20, 9), Some(2));
-        assert_eq!(pick_landing(&landings, 3 << 20, 9), Some(3));
-        assert_eq!(pick_landing(&landings, 9 << 20, 9), None);
+        assert_eq!(pick_landing(landings.iter().copied(), 1 << 20, 9), Some(2));
+        assert_eq!(pick_landing(landings.iter().copied(), 3 << 20, 9), Some(3));
+        assert_eq!(pick_landing(landings.iter().copied(), 9 << 20, 9), None);
         // At 10 the first is free too, and is the smallest for 3 MiB.
-        assert_eq!(pick_landing(&landings, 3 << 20, 10), Some(0));
+        assert_eq!(pick_landing(landings.iter().copied(), 3 << 20, 10), Some(0));
         // At 6 none is: a use that the card has not passed holds its buffer.
-        assert_eq!(pick_landing(&landings, 1, 6), None);
+        assert_eq!(pick_landing(landings.iter().copied(), 1, 6), None);
         // The value itself frees it (the signal is behind the read).
-        assert_eq!(pick_landing(&landings, 1, 7), Some(2));
-        assert_eq!(pick_landing(&[], 1, u64::MAX), None);
+        assert_eq!(pick_landing(landings.iter().copied(), 1, 7), Some(2));
+        assert_eq!(pick_landing(std::iter::empty(), 1, u64::MAX), None);
     }
 
     /// A shader of the direct queue that takes a while and then stores a
