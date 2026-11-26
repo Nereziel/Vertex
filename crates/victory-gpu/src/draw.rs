@@ -772,6 +772,12 @@ fn streaming_budget(bytes: u64, ms: u64, backlog: usize, interval_ms: u64, ahead
     (bytes, ceiling.min(slice.clamp(4, if large { 40 } else { 16 })))
 }
 
+// Only skip value-only fixed-function state, never mutable descriptor handles.
+fn skip_state_calls() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_STATE_CALLS").is_some_and(|v| v == "1"))
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -952,16 +958,25 @@ impl State {
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        if skip_state_calls() && factor.is_some_and(|next| self.blend.is_some_and(|old| old.map(f32::to_bits) == next.map(f32::to_bits))) {
+            return;
+        }
         self.blend = factor.copied();
         crate::draw::blend_factor(list, factor);
     }
 
     pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        if skip_state_calls() && self.stencil == Some(reference) {
+            return;
+        }
         self.stencil = Some(reference);
         crate::draw::stencil_ref(list, reference);
     }
 
     pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        if skip_state_calls() && self.depth_bounds.is_some_and(|old| old.map(f32::to_bits) == [min.to_bits(), max.to_bits()]) {
+            return;
+        }
         self.depth_bounds = Some([min, max]);
         crate::draw::depth_bounds(list, min, max);
     }
