@@ -471,8 +471,13 @@ pub(crate) fn behind() -> bool {
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") && crate::host::late() && cuts();
         if on {
-            tracing::info!("submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)");
-            let _ = std::thread::Builder::new().name("victory-submit".into()).spawn(worker);
+            match std::thread::Builder::new().name("victory-submit".into()).spawn(worker) {
+                Ok(_) => tracing::info!("submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "submission worker unavailable; keeping synchronous submission");
+                    return false;
+                }
+            }
         }
         on
     })
