@@ -116,6 +116,38 @@ impl Pending {
         }
     }
 
+    /// Live title pipeline objects with the same key can share a pending
+    /// translation and PSO. Weak entries never keep a GPU object alive.
+    pub(crate) fn shared(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Arc<Pending> {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_PSO_SHARE").is_some_and(|v| v == "1")) {
+            return Arc::new(Self::new(shaders, graphics));
+        }
+        Self::intern(Self::new(shaders, graphics))
+    }
+
+    fn intern(pending: Pending) -> Arc<Pending> {
+        use std::collections::HashMap;
+        use std::sync::{LazyLock, Weak};
+        static LIVE: LazyLock<Mutex<HashMap<String, Weak<Pending>>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+        const MAX: usize = 8192;
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = live.get(&pending.key).and_then(Weak::upgrade)
+            && !matches!(old.made.get(), Some(None))
+        {
+            return old;
+        }
+        if live.len() >= MAX {
+            live.retain(|_, p| p.strong_count() != 0);
+        }
+        let pending = Arc::new(pending);
+        if live.len() < MAX || live.contains_key(&pending.key) {
+            live.insert(pending.key.clone(), Arc::downgrade(&pending));
+        }
+        pending
+    }
+
     fn make(&self) {
         let _ = self.begun.set(Instant::now());
         self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
@@ -575,6 +607,13 @@ fn drained() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_identical_pipelines_share_pending_work() {
+        let a = Pending::intern(Pending::new(Vec::new(), None));
+        let b = Pending::intern(Pending::new(Vec::new(), None));
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
     use super::*;
 
     /// A first use queues the pipeline and, within the budget, gets the
