@@ -1329,22 +1329,24 @@ fn map_runs_parallel(physical: &mut Physical, runs: &[(usize, usize, Slice)]) ->
         for &(at, len, _) in group {
             split_placeholder(at, len);
         }
-        let mut done = vec![false; group.len()];
+        let mut done = vec![None; group.len()];
         let width = group.len().div_ceil(map_workers());
         std::thread::scope(|scope| {
             for (part, results) in group.chunks(width).zip(done.chunks_mut(width)) {
                 let work = move || {
                     for ((at, len, slice), ok) in part.iter().zip(results) {
-                        *ok = show_mapping(*at, *len, slice);
+                        *ok = Some(show_mapping(*at, *len, slice));
                     }
                 };
                 // Scoped workers finish before the caller records any view.
-                scope.spawn(work);
+                if let Err(e) = std::thread::Builder::new().name("victory-map".into()).spawn_scoped(scope, work) {
+                    tracing::warn!(error = %e, "mapping worker unavailable; caller maps its runs");
+                }
             }
         });
         let mut ok = true;
         for ((at, len, slice), done) in group.iter().zip(done) {
-            if done {
+            if done.unwrap_or_else(|| show_mapping(*at, *len, slice)) {
                 note_mapping(physical, *at, *len, slice.clone());
             } else {
                 ok = false;
@@ -2194,6 +2196,18 @@ mod tests {
         assert!(!same_pages(&p, base, &pages[1..]));
         assert!(!same_pages(&p, base + PAGE * 3, &pages[..1]));
         assert!(!same_pages(&p, base, &[0]));
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn map_run_plan_keeps_order_and_groups_only_consecutive_offsets() {
+        let pages = allocate(3);
+        let mut p = Physical::default();
+        for &page in &pages { p.pages.insert(page, slice_of(page)); }
+        let base = 32 * PAGE;
+        let runs = plan_map_runs(&p, base, &[pages[0], pages[1], pages[0], pages[2]]).unwrap();
+        assert_eq!(runs.iter().map(|(at, len, _)| (*at, *len)).collect::<Vec<_>>(), [(base, 2 * PAGE), (base + 2 * PAGE, PAGE), (base + 3 * PAGE, PAGE)]);
+        assert!(plan_map_runs(&p, base, &[pages[0], 0]).is_none());
         assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 
