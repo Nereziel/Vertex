@@ -3161,6 +3161,32 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// Whether the host allows a typed UAV of this format. Query once per
+/// format on our single host device; raw/structured buffer UAVs are separate.
+fn typed_uav_supported(format: DXGI_FORMAT) -> bool {
+    static KNOWN: [std::sync::OnceLock<bool>; 192] =
+        [const { std::sync::OnceLock::new() }; 192];
+    let check = || {
+        let Some(host) = host() else { return false; };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: the query writes a structure of the specified size.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }.is_ok() && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    };
+    match KNOWN.get(format.0 as usize) {
+        Some(slot) => *slot.get_or_init(check),
+        None => check(),
+    }
+}
+
 /// The title's unordered access view of a depth texture, as a view of the
 /// texture's colour twin `twin` ([`crate::resource::Twin`]): the same mip
 /// and slices, in the colour format of the twin's family for a depth or
@@ -3378,6 +3404,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 None => texture,
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+                return None;
+            }
+            // Check the final format, after fits has selected a stand-in or
+            // the texture's own format. Unsupported typed UAVs can remove the device.
+            let format = desc.as_ref().map(|d| d.Format).filter(|f| f.0 != 0)
+                .unwrap_or_else(|| unsafe { texture.GetDesc() }.Format);
+            if !typed_uav_supported(format) {
+                once!(format = format.0, "an unordered view in a format the host cannot use");
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
