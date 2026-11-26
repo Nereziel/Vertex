@@ -162,33 +162,10 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
-/// With the opt-in automatic profile, consider smaller GPU buffers only
-/// when the initial local budget leaves ample room. Unknown/small budgets
-/// retain the original minimum; never increase the total card allocation.
-fn auto_card_min(budget: Option<u64>) -> u64 {
-    if budget.is_some_and(|b| b >= 8 << 30) { 256 << 10 } else { 1 << 20 }
-}
-
-#[cfg(test)]
-mod auto_card_min_tests {
-    use super::auto_card_min;
-
-    #[test]
-    fn only_large_known_budgets_lower_the_minimum() {
-        assert_eq!(auto_card_min(None), 1 << 20);
-        assert_eq!(auto_card_min(Some(0)), 1 << 20);
-        assert_eq!(auto_card_min(Some((8 << 30) - 1)), 1 << 20);
-        assert_eq!(auto_card_min(Some(8 << 30)), 256 << 10);
-        assert_eq!(auto_card_min(Some(12 << 30)), 256 << 10);
-    }
-}
-
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1024).
-/// `VICTORY_AUTO_CARD_MIN=1` uses 256 KiB from an initial local budget of
-/// 8 GiB, unless either minimum is set explicitly.
 /// `VICTORY_CARD_BUFFERS_MIN_KB` names the smallest in KiB instead, below
 /// 1 MiB too (0: every title buffer): run int-k-2's world has 3,604 title
 /// buffers under 1 MiB, 42 MB in all, that shaders read over the bus.
@@ -206,15 +183,6 @@ fn card_limits() -> (u64, u64) {
         // drawn in every run.
         let least = match std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
             Some(kb) => kb << 10,
-            None if std::env::var_os("VICTORY_CARD_BUFFERS_MIN_KB").is_none()
-                && std::env::var_os("VICTORY_CARD_BUFFERS_MIN_MB").is_none()
-                && std::env::var_os("VICTORY_AUTO_CARD_MIN").is_some_and(|v| v == "1") =>
-            {
-                let budget = host().and_then(|h| h.video_memory()).map(|v| v[0]);
-                let least = auto_card_min(budget);
-                tracing::info!(?budget, min_kb = least >> 10, "automatic initial GPU buffer minimum");
-                least
-            }
             None => mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20),
         };
         (least, mb("VICTORY_CARD_BUFFERS_MB", 1024))
@@ -315,34 +283,6 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
-}
-
-/// The byte bound for the GPU's 16-byte hash loads. The allocation is
-/// aligned and never smaller than the title range.
-fn card_hash_len(len: u64, size: u64, short: bool) -> u64 {
-    if short {
-        len.saturating_add(15).min(size) & !15
-    } else {
-        size
-    }
-}
-
-#[cfg(test)]
-mod card_hash_len_tests {
-    use super::card_hash_len;
-
-    #[test]
-    fn short_hash_bound_covers_every_title_byte_but_not_padding() {
-        for len in [1u64, 15, 16, 17, 288, 65535, 65536, 65537, 1048575] {
-            let size = len.next_multiple_of(65536);
-            let hashed = card_hash_len(len, size, true);
-            assert!(hashed >= len && hashed <= size && hashed - len < 16);
-            assert_eq!(hashed % 16, 0);
-            assert_eq!(card_hash_len(len, size, false), size);
-        }
-        assert_eq!(card_hash_len(288, 65536, true), 288);
-        assert_eq!(card_hash_len(0, 65536, true), 0);
-    }
 }
 
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
@@ -2123,7 +2063,8 @@ fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
     let n = now.len().min(was.len());
     let (now, was) = (&now[..n], &was[..n]);
-    let mut runs = Vec::with_capacity(64);
+    // Do not allocate for the common all-equal case.
+    let mut runs = Vec::new();
     // The first byte of a run not yet ended.
     let mut open: Option<usize> = None;
     let mut base = 0;
@@ -4094,18 +4035,6 @@ impl Shadow {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
         Some((&card.staging, before, card.size))
-    }
-
-    /// Bytes hashed by both the before and after passes. Padding beyond the
-    /// title buffer is never fetched into title memory. Keep the original
-    /// full allocation by default; opt in to the shorter 16-byte-aligned
-    /// bound. Fetches, allocation sizes and piece numbering stay unchanged.
-    pub(crate) fn card_hashed(&self) -> Option<u64> {
-        static SHORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let size = self.card.as_ref()?.size;
-        Some(card_hash_len(self.len, size, *SHORT.get_or_init(|| {
-            std::env::var_os("VICTORY_CARD_HASH_LEN").is_some_and(|v| v == "1")
-        })))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes

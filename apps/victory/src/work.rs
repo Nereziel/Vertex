@@ -76,7 +76,6 @@ const AUTO: &[(&str, &str)] = &[
     ("VICTORY_TEXTURE_DROP_MIPS", "1"),
     ("VICTORY_CHANGED_RUNS", "1"),
     ("VICTORY_ADAPTIVE_TEXTURE_FLOOR", "1"),
-    ("VICTORY_AUTO_CARD_MIN", "1"),
 ];
 
 impl Work {
@@ -131,7 +130,6 @@ mod tests {
         assert_eq!(extra, [
             ("VICTORY_CHANGED_RUNS", "1"),
             ("VICTORY_ADAPTIVE_TEXTURE_FLOOR", "1"),
-            ("VICTORY_AUTO_CARD_MIN", "1"),
         ]);
     }
 

@@ -121,12 +121,11 @@ are in [docs/test-runs.md](docs/test-runs.md).
 | `VICTORY_PERF_CAPTION=1` | extended window title performance display: FPS, frame time, CPU submission preparation, estimated queue busy percentage, pending PSOs, drops and DXGI memory usage/budget. Updated once per second; not an in-frame overlay. Off by default. |
 | `VICTORY_ADAPTIVE_TEXTURE_FLOOR=1` | experimental: cap the unconditional texture allowance at one third of the initial DXGI local memory budget (never above 2 GiB); default off. The live usage checks and manual budget override remain unchanged. |
 | `VICTORY_TEXTURE_BUDGET_MB=<n>` | at most this much card memory for those textures: less pressure on memory, blurrier picture |
-| `VICTORY_CARD_HASH_LEN=1` | experimental: hash only title buffer bytes (rounded to 16 bytes), not allocation padding; off by default. Test with small card buffers separately. |
 | `VICTORY_CHANGED_RUNS=1` | experimental SSE2 comparison of exact changed byte ranges, 64 bytes at a time; off by default, `0` restores the original path. Does not change shaders or widen writes. Benchmark with the same save and warm cache. |
 | `VICTORY_CARD_BUFFERS_MB`, `VICTORY_CARD_WINDOWS_MB` | how much of the title's memory is copied to the card (`VICTORY_CARD_WINDOWS_MB=0`: no windows) |
 | `VICTORY_SHADER_OPT=0` | no clean-up of translated shaders: try it if you see black blocks. Everything is translated again |
 | `VICTORY_BVH_BUILDER=1` | asks for ray tracing. Slow (about 4 fps), and not tested with the merged build apart from one run that hung |
-| `--work cpu`, `balanced`, `gpu`, `auto` (`victory run`) | where work is done that both sides can do; `balanced` remains the launcher's default. `auto` is experimental: balanced settings plus exact SIMD comparisons, adaptive texture floor and a 256 KiB card-buffer minimum when the initial DXGI local budget is at least 8 GiB. Existing manual overrides win; no translator switches are changed. |
+| `--work cpu`, `balanced`, `gpu`, `auto` (`victory run`) | where work is done that both sides can do; `balanced` remains the launcher's default. `auto` is experimental: balanced settings plus exact SIMD comparisons and adaptive texture floor. The normal 1 MiB card-buffer minimum is unchanged (manual VICTORY_CARD_BUFFERS_MIN_KB still works). Existing manual overrides win; no translator switches are changed. |
 
 More switches are described in comments where the code reads them.
 
