@@ -185,8 +185,8 @@ pub(crate) mod pace {
     static LINE_AT: AtomicU64 = AtomicU64::new(0);
 
     /// Whether events are said one by one now: four seconds of every two
-    /// minutes of the wall clock, the same seconds in which the loader says
-    /// the title's `mwaitx` waits (`console_insn`), to lay the two side by side.
+    /// minutes of the wall clock, so that logs from other parts can be laid
+    /// beside them by the same seconds.
     fn detail_now() -> bool {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).is_ok_and(|d| d.as_secs() % 120 < 4)
     }
