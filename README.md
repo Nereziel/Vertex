@@ -39,7 +39,7 @@ or publisher.
 
 ### Getting started
 
-1. Get the code: `git clone https://github.com/proneonn/Vertex`
+1. Get the code: `git clone https://github.com/Nereziel/Vertex`
 2. Double-click `Launcher.cmd`. It finds your copy's executable, checks this
    PC, installs what is missing and starts the title.
 
@@ -109,7 +109,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 1. **Close other programs**, browsers first. With little memory free, freezes
    get longer.
 2. **Run twice.** The second start uses the shaders and pipelines of the first.
-3. **Try the faster submission settings:** `.\start.ps1 -GameExe <exe> -Tuned`
+3. **Try the faster submission settings:** `.\start.ps1 -GameExe <exe> -Tuned`. The relay already enables these settings by default; the switch also supports runs with the relay disabled.
 4. **Change one setting at a time**, set before the start
    (`$env:NAME = 'value'`):
 
@@ -119,6 +119,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 | `VICTORY_TEXTURE_STAGE_MS=250` | the most that pass may take in any case, in ms (three times that with a large backlog) |
 | `VICTORY_TEXTURE_BUDGET_MB=<n>` | at most this much card memory for those textures: less pressure on memory, blurrier picture |
 | `VICTORY_CARD_BUFFERS_MB`, `VICTORY_CARD_WINDOWS_MB` | how much of the title's memory is copied to the card (`VICTORY_CARD_WINDOWS_MB=0`: no windows) |
+| `VICTORY_HEAP_WORKER=1` | experimental texture uploads on a separate worker; needs late submission. Already implemented in Vertex; compare warm-cache runs and check texture pop-in before enabling permanently |
 | `VICTORY_WATCH_APART=1` | experimental parallel WriteWatch queries for disjoint pages; off by default. Compare the same warm-cache scene with `0` and `1`; disable if geometry, textures or stability regress |
 | `VICTORY_SHADER_OPT=0` | no clean-up of translated shaders: try it if you see black blocks. Everything is translated again |
 | `VICTORY_BVH_BUILDER=1` | asks for ray tracing. Slow (about 4 fps), and not tested with the merged build apart from one run that hung |
