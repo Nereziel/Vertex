@@ -83,11 +83,21 @@ $null = Add-Control (New-Object System.Windows.Forms.Label) 16 14 528 20 `
 $path = Add-Control (New-Object System.Windows.Forms.TextBox) 16 36 430 24 $choices.GameExe
 $browse = Add-Control (New-Object System.Windows.Forms.Button) 454 34 90 27 'Browse...'
 $null = Add-Control (New-Object System.Windows.Forms.Label) 16 77 70 20 'Work split:'
-$work = Add-Control (New-Object System.Windows.Forms.ComboBox) 90 73 226 24
-$work.DropDownStyle = 'DropDownList'
+# Not named $work: PowerShell names are not case-sensitive, and a parameter
+# called $Work on the call stack would hide it (the "array index evaluated
+# to null" of Play, Browse and Pre-build).
+$workBox = Add-Control (New-Object System.Windows.Forms.ComboBox) 90 73 226 24
+$workBox.DropDownStyle = 'DropDownList'
 $works = 'cpu', 'balanced', 'gpu'
-$work.Items.AddRange(@('Processor (saves card memory)', 'Balanced', 'Graphics card (more memory)'))
-$work.SelectedIndex = [Array]::IndexOf($works, $choices.Work)
+$workBox.Items.AddRange(@('Processor (saves card memory)', 'Balanced', 'Graphics card (more memory)'))
+$index = [Array]::IndexOf($works, $choices.Work)
+$workBox.SelectedIndex = if ($index -ge 0) { $index } else { 1 }
+
+# The chosen work split; balanced when nothing is chosen.
+function Get-WorkChoice {
+    $index = $script:workBox.SelectedIndex
+    if ($index -ge 0 -and $index -lt $works.Count) { $works[$index] } else { 'balanced' }
+}
 $prebuild = Add-Control (New-Object System.Windows.Forms.Button) 330 70 214 30 'Pre-build shaders'
 $check = Add-Control (New-Object System.Windows.Forms.Button) 16 112 126 34 'Check this PC'
 $install = Add-Control (New-Object System.Windows.Forms.Button) 150 112 160 34 'Install what is missing'
@@ -100,12 +110,12 @@ $status = Add-Control (New-Object System.Windows.Forms.Label) 16 188 528 44 `
 $form.AcceptButton = $play
 
 function Save-Form {
-    Save-Choices @{ GameExe = $path.Text.Trim(); Work = $works[$work.SelectedIndex]; Lossless = $lossless.Checked }
+    Save-Choices @{ GameExe = $path.Text.Trim(); Work = (Get-WorkChoice); Lossless = $lossless.Checked }
 }
 
 # A button's work; what goes wrong is shown, not thrown out of the window.
-function Invoke-Safely([scriptblock]$Work) {
-    try { & $Work } catch { $status.Text = "Failed: $($_.Exception.Message)" }
+function Invoke-Safely([scriptblock]$Action) {
+    try { & $Action } catch { $status.Text = "Failed: $($_.Exception.Message)" }
 }
 
 $browse.Add_Click({ Invoke-Safely {
@@ -137,7 +147,7 @@ function Start-Title([bool]$Ahead, [string]$Said) {
         return
     }
     Save-Form
-    Open-Console (Get-PlayArguments $exe $works[$work.SelectedIndex] $Ahead $lossless.Checked)
+    Open-Console (Get-PlayArguments $exe (Get-WorkChoice) $Ahead $lossless.Checked)
     $status.Text = $Said
 }
 $play.Add_Click({ Invoke-Safely { Start-Title $false 'Building, checking and starting in the other window.' } })
@@ -153,6 +163,17 @@ if ($SelfTest) {
     if ($line -ne '-GameExe "D:\a b\t.exe" -Prebuild') { throw "pre-build: $line" }
     $line = (Get-PlayArguments 'D:\a b\t.exe' 'balanced' $false $true) -join ' '
     if ($line -ne '-GameExe "D:\a b\t.exe" -LosslessScaling') { throw "lossless: $line" }
+    # The work split as a button's handler reads it (through Invoke-Safely).
+    $status.Text = ''
+    $script:seen = $null
+    Invoke-Safely { $script:seen = Get-WorkChoice }
+    if ($status.Text -or $script:seen -ne $choices.Work) { throw "work split in a handler: '$($script:seen)' $($status.Text)" }
+    $workBox.SelectedIndex = 2
+    Invoke-Safely { $script:seen = Get-WorkChoice }
+    if ($status.Text -or $script:seen -ne 'gpu') { throw "work split after a change: '$($script:seen)' $($status.Text)" }
+    $workBox.SelectedIndex = -1
+    Invoke-Safely { $script:seen = Get-WorkChoice }
+    if ($status.Text -or $script:seen -ne 'balanced') { throw "work split fallback: '$($script:seen)' $($status.Text)" }
     $form.Dispose()
     'launcher: ok'
     exit 0
