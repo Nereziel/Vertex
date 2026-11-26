@@ -2503,6 +2503,15 @@ impl State {
         self.dispatch_inner(list, x, y, z, flags);
     }
 
+    /// Explicit synchronization or a buffer copy can separate two versions
+    /// of the same indirect argument buffer. Never reuse a clamped window
+    /// across that boundary. Gather runs at the head of the list, so it
+    /// must also stop accepting records at that point.
+    pub(crate) fn indirect_boundary(&mut self, list: &HostList) {
+        self.window = None;
+        list.gather_close();
+    }
+
     fn dispatch_inner(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
