@@ -433,6 +433,12 @@ impl State {
     /// slots out, and up to 4,900 draws a frame went without their tables.
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
+    /// A completed detached list will never be recorded again. Release
+    /// available slots now; contended ones stay for its normal destructor.
+    pub(crate) fn try_tables_done(&mut self) {
+        self.dynamic.retain(|&(heap, first, n)| !crate::descriptor::try_release_dynamic(heap, first, n));
+    }
+
     pub(crate) fn tables_done(&mut self) {
         if self.tables_gone && self.dynamic.is_empty() {
             return;
