@@ -30,7 +30,8 @@
 // than when the recording thread did it all; with a backlog it is earlier,
 // since the pass has the whole frame instead of a slice of it.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::{Acquire, AcqRel, Relaxed}};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use crate::descriptor::Heap;
@@ -198,17 +199,20 @@ pub(crate) fn take_ready() -> Vec<HostList> {
         .collect()
 }
 
-/// The heap the next pass is over, and what wakes the worker.
+/// Pending heaps, coalesced per heap rather than replacing a different heap.
 struct Job {
-    heap: Mutex<Option<HeldHeap>>,
+    heaps: Mutex<VecDeque<HeldHeap>>,
     wake: Condvar,
 }
 
 static JOB: OnceLock<Job> = OnceLock::new();
 /// Held by whoever runs the pass.
 static PASS: Mutex<()> = Mutex::new(());
-/// A recording thread waits for [`PASS`].
-static URGENT: AtomicBool = AtomicBool::new(false);
+/// Recording threads waiting for [`PASS`]. A count rather than a flag:
+/// one waiter acquiring the pass must not hide a second waiting thread.
+static URGENT: AtomicUsize = AtomicUsize::new(0);
+static URGENT_LOCK: Mutex<()> = Mutex::new(());
+static URGENT_WAKE: Condvar = Condvar::new();
 
 /// A pass over `heap` is due (once a frame). False if there is no worker:
 /// the caller runs the pass itself.
@@ -218,7 +222,7 @@ pub(crate) fn kick(heap: &Heap) -> bool {
     }
     static STARTED: OnceLock<bool> = OnceLock::new();
     let started = *STARTED.get_or_init(|| {
-        JOB.get_or_init(|| Job { heap: Mutex::new(None), wake: Condvar::new() });
+        JOB.get_or_init(|| Job { heaps: Mutex::new(VecDeque::new()), wake: Condvar::new() });
         match std::thread::Builder::new().name("victory-heap".into()).spawn(worker) {
             Ok(_) => {
                 tracing::info!("textures picked by index are uploaded by a thread of their own (VICTORY_HEAP_WORKER)");
@@ -233,8 +237,12 @@ pub(crate) fn kick(heap: &Heap) -> bool {
     let Some(job) = JOB.get().filter(|_| started) else {
         return false;
     };
-    *lock(&job.heap) = Some(HeldHeap::new(heap));
-    job.wake.notify_one();
+    let mut pending = lock(&job.heaps);
+    let this: This = std::ptr::from_ref(heap).cast();
+    if !pending.iter().any(|held| held.0 == this) {
+        pending.push_back(HeldHeap::new(heap));
+        job.wake.notify_one();
+    }
     true
 }
 
@@ -245,15 +253,23 @@ pub(crate) fn urgent() -> MutexGuard<'static, ()> {
     if let Ok(pass) = PASS.try_lock() {
         return pass;
     }
-    URGENT.store(true, Relaxed);
+    {
+        let _wake = lock(&URGENT_LOCK);
+        URGENT.fetch_add(1, AcqRel);
+    }
     let pass = lock(&PASS);
-    URGENT.store(false, Relaxed);
+    {
+        let _wake = lock(&URGENT_LOCK);
+        if URGENT.fetch_sub(1, AcqRel) == 1 {
+            URGENT_WAKE.notify_all();
+        }
+    }
     pass
 }
 
 /// Whether the worker is to stop where it is ([`urgent`]).
 pub(crate) fn make_way() -> bool {
-    URGENT.load(Relaxed)
+    URGENT.load(Acquire) != 0
 }
 
 fn worker() {
@@ -262,9 +278,9 @@ fn worker() {
     };
     loop {
         let heap = {
-            let mut next = lock(&job.heap);
+            let mut next = lock(&job.heaps);
             loop {
-                match next.take() {
+                match next.pop_front() {
                     Some(heap) => break heap,
                     None => next = job.wake.wait(next).unwrap_or_else(|e| e.into_inner()),
                 }
@@ -280,9 +296,11 @@ fn worker() {
             }
         }
         STATS[0].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
-        // Whoever wants the pass now has it first.
+        // Sleep, rather than continuously yielding a core during a queue of
+        // urgent recording passes. The condition is changed under this lock.
+        let mut waiting = lock(&URGENT_LOCK);
         while make_way() {
-            std::thread::yield_now();
+            waiting = URGENT_WAKE.wait(waiting).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
