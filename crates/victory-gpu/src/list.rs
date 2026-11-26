@@ -382,12 +382,12 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
     let mut parts: Parts = vec![(Vec::new(), Vec::new(), Vec::new())];
     // The lists taken: where its one host list is (entry, place), or none
     // for a list of several parts.
-    let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::new();
+    let mut seen: std::collections::HashMap<This, Option<(usize, usize)>> = std::collections::HashMap::with_capacity(lists.len());
     for &this in lists {
         if this.is_null() {
             continue;
         }
-        if let Some(&(_, at)) = seen.iter().find(|(t, _)| *t == this) {
+        if let Some(&at) = seen.get(&this) {
             match at {
                 Some((entry, place)) if entry + 1 == parts.len() => parts[entry].2.push(place),
                 _ => {
@@ -449,7 +449,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             taken.push(detached);
             last = Some((entry, place));
         }
-        seen.push((this, if single { last } else { None }));
+        seen.insert(this, if single { last } else { None });
     }
     // (The first entry is empty if the first list begins with a wait.)
     parts.retain(|(_, taken, _)| !taken.is_empty());
@@ -461,13 +461,14 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 /// its next reset: what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
-    let mut taken: Vec<(This, Detached)> = Vec::new();
-    let mut order = Vec::new();
+    let mut taken: Vec<Detached> = Vec::with_capacity(lists.len());
+    let mut seen = std::collections::HashMap::with_capacity(lists.len());
+    let mut order = Vec::with_capacity(lists.len());
     for &this in lists {
         if this.is_null() {
             continue;
         }
-        if let Some(i) = taken.iter().position(|(t, _)| *t == this) {
+        if let Some(&i) = seen.get(&this) {
             order.push(i);
             continue;
         }
@@ -490,17 +491,12 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
                 std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
             (host, uploads, state)
         };
-        order.push(taken.len());
-        taken.push((
-            this,
-            Detached {
-                host,
-                _uploads: uploads,
-                _state: state,
-            },
-        ));
+        let i = taken.len();
+        seen.insert(this, i);
+        order.push(i);
+        taken.push(Detached { host, _uploads: uploads, _state: state });
     }
-    (taken.into_iter().map(|(_, d)| d).collect(), order)
+    (taken, order)
 }
 
 pub(crate) extern "system" fn create_allocator(
