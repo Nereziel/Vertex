@@ -17,7 +17,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -990,6 +989,30 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+// Separate reusable buffers for the file source, intermediate BCPack stream
+// and scattered destination. They can be needed at the same time.
+#[derive(Clone, Copy)]
+enum Scratch { Source = 0, Packed = 1, Destination = 2 }
+
+fn scratch<T>(kind: Scratch, len: usize, f: impl FnOnce(&mut [u8]) -> T) -> T {
+    thread_local! {
+        static BUFFERS: std::cell::RefCell<[Vec<u8>; 3]> = const {
+            std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new()])
+        };
+    }
+    const KEEP: usize = 2 << 20;
+    let index = kind as usize;
+    let mut bytes = BUFFERS.with(|b| std::mem::take(&mut b.borrow_mut()[index]));
+    // Preserve the zero-initialized scratch semantics, including short decodes.
+    bytes.resize(len, 0);
+    let result = f(&mut bytes);
+    if bytes.capacity() <= KEEP {
+        bytes.clear();
+        BUFFERS.with(|b| b.borrow_mut()[index] = bytes);
+    }
+    result
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request, pages: Option<&PageRuns>) -> Result<(), HRESULT> {
     let options = request.options;
@@ -1033,30 +1056,42 @@ fn execute(request: &Request, pages: Option<&PageRuns>) -> Result<(), HRESULT> {
             if !bounce {
                 return read_into(request, out).map(|()| size);
             }
-            let mut data = vec![0; size];
-            read_into(request, &mut data)?;
-            out.copy_from_slice(&data);
-            Ok(size)
+            scratch(Scratch::Source, size, |data| {
+                read_into(request, data)?;
+                out.copy_from_slice(data);
+                Ok(size)
+            })
         })
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
-    } else {
-        source
+    let decode = |source: &[u8]| {
+        let write = |source: &[u8]| into_destination(request, pages, size, |out| match tables {
+            Some(tables) => bcpack::decode(bc, source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
+        });
+        // The console's order: zlib first, then BCPack.
+        if bc != 0 && options & ZLIB != 0 {
+            scratch(Scratch::Packed, request.intermediate_size as usize, |packed| {
+                let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+                write(&packed[..n])
+            })
+        } else {
+            write(source)
+        }
     };
-    into_destination(request, pages, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+    let source_size = request.source_size as usize;
+    if options & MEMORY_SOURCE != 0 {
+        // SAFETY: the title holds its source until completion.
+        decode(unsafe { std::slice::from_raw_parts(request.source.cast(), source_size) })?;
+    } else {
+        scratch(Scratch::Source, source_size, |source| {
+            read_into(request, source).map_err(|hr| fail(hr, "reading the source"))?;
+            decode(source)
+        })?;
+    }
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -1153,20 +1188,6 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
-    let size = request.source_size as usize;
-    if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
-    }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
-}
-
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
@@ -1252,8 +1273,8 @@ fn into_destination(
         runs.written(len);
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
+    scratch(Scratch::Destination, len, |data| {
+    let n = fill(data)?;
     // A page the title has just made, or a view the host refuses for a
     // moment, comes right a little later: the write is tried again before
     // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
@@ -1313,6 +1334,7 @@ fn into_destination(
         );
         Err(E_INVALIDARG)
     }
+    })
 }
 
 /// Slots by the 2020 order, which the argument shapes at
