@@ -110,7 +110,13 @@ are in [docs/test-runs.md](docs/test-runs.md).
    get longer.
 2. **Run twice.** The second start uses the shaders and pipelines of the first.
 3. **Try the faster submission settings:** `.\start.ps1 -GameExe <exe> -Tuned`. The relay already enables these settings by default; the switch also supports runs with the relay disabled.
-4. **Change one setting at a time**, set before the start
+4. **Try experimental faster world streaming** after a warm-cache baseline:
+   `.\start.ps1 -GameExe <exe> -FastStreaming`. This enables the existing
+   texture worker, parallel texture checks, persistent physical-page views
+   and parallel WriteWatch (plus `-Tuned`). Individual environment overrides
+   still win; omit the switch to return to the default. The combined profile
+   is not yet benchmarked and should not be treated as a proven FPS gain.
+5. **Change one setting at a time**, set before the start
    (`$env:NAME = 'value'`):
 
 | Variable | Effect |
@@ -120,12 +126,23 @@ are in [docs/test-runs.md](docs/test-runs.md).
 | `VICTORY_TEXTURE_BUDGET_MB=<n>` | at most this much card memory for those textures: less pressure on memory, blurrier picture |
 | `VICTORY_CARD_BUFFERS_MB`, `VICTORY_CARD_WINDOWS_MB` | how much of the title's memory is copied to the card (`VICTORY_CARD_WINDOWS_MB=0`: no windows) |
 | `VICTORY_HEAP_WORKER=1` | experimental texture uploads on a separate worker; needs late submission. Already implemented in Vertex; compare warm-cache runs and check texture pop-in before enabling permanently |
+| `VICTORY_WIDE_TEXTURES=1` | parallel submission-time texture checks and detiling; experimental |
+| `VICTORY_XMEM_PERSISTENT_VIEW=1` | reuse physical-page section mappings instead of mapping and unmapping on every write; experimental |
+| `VICTORY_DSTORAGE_WORKERS=<n>` | limit the existing parallel read/decode pool to at most this many logical processors; unset uses all available processors. Try fewer workers if rendering threads are starved |
 | `VICTORY_WATCH_APART=1` | experimental parallel WriteWatch queries for disjoint pages; off by default. Compare the same warm-cache scene with `0` and `1`; disable if geometry, textures or stability regress |
 | `VICTORY_SHADER_OPT=0` | no clean-up of translated shaders: try it if you see black blocks. Everything is translated again |
 | `VICTORY_BVH_BUILDER=1` | asks for ray tracing. Slow (about 4 fps), and not tested with the merged build apart from one run that hung |
 | `--work cpu`, `balanced`, `gpu` (`victory run`) | where work is done that both sides can do; `balanced` is the measured choice and the launcher's default |
 
 More switches are described in comments where the code reads them.
+
+For loading comparisons, keep the driver, shader cache, save and scene the
+same. Measure start-to-world, time until geometry and textures are present,
+median and 90th-percentile frame time, and DirectStorage failures. Test
+`HEAP_WORKER`, `WIDE_TEXTURES`, `XMEM_PERSISTENT_VIEW`, and `WATCH_APART`
+individually before attributing a change to the combined profile. DirectStorage
+workers already decode in parallel; this fork reuses bounded scratch buffers
+and avoids repeated allocations without changing completion ordering.
 
 ## When something goes wrong
 
