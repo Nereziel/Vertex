@@ -755,6 +755,23 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+// Adaptive mode uses the interval between texture passes as a load proxy,
+// not a GPU utilisation measurement. Large backlogs keep the catch-up byte
+// budget; foreground passes have a smaller time slice than worker passes.
+fn streaming_budget(bytes: u64, ms: u64, backlog: usize, interval_ms: u64, ahead: bool, catchup: bool) -> (u64, u64) {
+    let large = catchup && backlog >= 1024;
+    let factor = if large { 3 } else { 1 };
+    let bytes = bytes.saturating_mul(factor);
+    let ceiling = ms.saturating_mul(factor);
+    if ahead {
+        // A worker may use the whole interval but not spend unbounded time
+        // in a pass while urgent recording work needs to take over.
+        return (bytes, ceiling.min(interval_ms.clamp(40, 250)));
+    }
+    let slice = if large { interval_ms / 4 } else { interval_ms / 8 };
+    (bytes, ceiling.min(slice.clamp(4, if large { 40 } else { 16 })))
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -2103,7 +2120,15 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        static ADAPTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let (per_frame, span) = if *ADAPTIVE.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ADAPTIVE").is_some_and(|v| v == "1")) {
+            let (bytes, ms) = streaming_budget(per_frame, span.as_millis() as u64, due.len(), took, matches!(into, Into::Ahead(_)), catchup);
+            (bytes, std::time::Duration::from_millis(ms))
+        } else if catchup && due.len() >= 1024 {
+            (per_frame.saturating_mul(3), span.saturating_mul(3))
+        } else {
+            (per_frame, span)
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -4290,4 +4315,14 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn adaptive_streaming_keeps_explicit_ceiling_and_bounded_foreground_slice() {
+    assert_eq!(streaming_budget(192, 250, 2048, 200, false, true), (576, 40));
+    assert_eq!(streaming_budget(192, 250, 64, 40, false, true), (192, 5));
+    assert_eq!(streaming_budget(192, 2, 2048, 200, false, true), (576, 6));
+    assert_eq!(streaming_budget(192, 250, 2048, 200, true, true), (576, 200));
+    assert_eq!(streaming_budget(192, 0, 2048, 200, true, false), (192, 0));
 }
