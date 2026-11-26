@@ -669,6 +669,8 @@ enum Answer {
 fn answer(first: usize, last: usize, guarded: bool) -> Answer {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     let view = guarded && known_view(first * PAGE);
     let mut found: Vec<usize> = Vec::new();
     let failed = view || {
@@ -689,17 +691,40 @@ fn answer(first: usize, last: usize, guarded: bool) -> Answer {
         found.truncate(count);
         status != 0
     };
-    if !failed {
-        return Answer::Written(found, Vec::new());
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        if view { crate::copystat::C::WatchKnownView } else { crate::copystat::C::WatchFailed },
+        failed as u64,
+    );
+    #[cfg(feature = "diagnostics")]
+    if failed && !view && guarded {
+        failed_asking(first * PAGE, last * PAGE);
     }
-    if !guarded {
-        return Answer::Unwatched;
+    let result = if !failed {
+        Answer::Written(found, Vec::new())
+    } else if !guarded {
+        Answer::Unwatched
+    } else {
+        #[cfg(feature = "diagnostics")]
+        let guarding = std::time::Instant::now();
+        let pages = guard(first * PAGE, last * PAGE, view);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        match pages {
+            Some(pages) => Answer::Written(Vec::new(), pages),
+            None if view => Answer::Again,
+            None => Answer::Unwatched,
+        }
+    };
+    #[cfg(feature = "diagnostics")]
+    if matches!(&result, Answer::Written(..)) {
+        use crate::copystat::{C, add};
+        let elapsed = started.elapsed().as_micros() as u64;
+        add(C::Watches, 1);
+        add(C::WatchUs, elapsed);
+        slow(elapsed);
     }
-    match guard(first * PAGE, last * PAGE, view) {
-        Some(pages) => Answer::Written(Vec::new(), pages),
-        None if view => Answer::Again,
-        None => Answer::Unwatched,
-    }
+    result
 }
 
 /// The journal told what `kernel` (addresses) and `pages` (page numbers)
