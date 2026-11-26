@@ -2573,7 +2573,8 @@ fn late_writes() -> bool {
 
 /// Per host copy, the ranges a submission's shaders may write, as declared
 /// (address, end).
-type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+type WriteGroup<C> = (C, Vec<(usize, usize)>);
+type Declared = WriteGroup<std::sync::Arc<crate::shadow::Shadow>>;
 
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
@@ -3858,7 +3859,7 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// first-seen range order. Only exact duplicate ranges are dropped.
 /// The index avoids a linear scan of all earlier copies per GPU write.
 struct WriteGroups<C> {
-    groups: Vec<(C, Vec<(usize, usize)>)>,
+    groups: Vec<WriteGroup<C>>,
     index: std::collections::HashMap<usize, usize>,
 }
 
@@ -3882,7 +3883,7 @@ impl<C: Clone> WriteGroups<C> {
         }
     }
 
-    fn finish(self) -> Vec<(C, Vec<(usize, usize)>)> {
+    fn finish(self) -> Vec<WriteGroup<C>> {
         self.groups
     }
 }
@@ -7565,43 +7566,7 @@ impl HostList {
                 _ => None,
             })
             .collect();
-        // Opt-in parallel CPU preparation only. The caller waits for every
-        // refresh before closing the list and publishing its descriptors.
-        // Use scoped workers here, not the shared submission pool: the
-        // caller holds the heap pass lock and must not help queued jobs
-        // which might depend on that lock.
-        static THREADS: OnceLock<usize> = OnceLock::new();
-        let threads = *THREADS.get_or_init(|| {
-            let available = std::thread::available_parallelism().map_or(1, |n| n.get());
-            std::env::var("VICTORY_AHEAD_THREADS").ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(1).clamp(1, 4).min(available)
-        });
-        let refresh = |group: &[std::sync::Arc<crate::texture::Staging>]| {
-            group.iter().filter(|staging| !staging.refresh_ahead()).count() as u64
-        };
-        if threads == 1 || textures.len() < 16 {
-            return refresh(&textures);
-        }
-        std::thread::scope(|scope| {
-            let mut groups = textures.chunks(textures.len().div_ceil(threads));
-            let own = groups.next().unwrap_or_default();
-            let mut jobs = Vec::with_capacity(threads - 1);
-            let mut left = 0;
-            for group in groups {
-                match std::thread::Builder::new().name("victory-ahead".into())
-                    .spawn_scoped(scope, move || refresh(group))
-                {
-                    Ok(job) => jobs.push(job),
-                    Err(_) => left += refresh(group),
-                }
-            }
-            left += refresh(own);
-            for job in jobs {
-                left += job.join().expect("texture preparation worker panicked");
-            }
-            left
-        })
+        textures.iter().filter(|staging| !staging.refresh_ahead()).count() as u64
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`

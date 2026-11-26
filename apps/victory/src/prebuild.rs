@@ -31,9 +31,11 @@ type Found = (usize, usize, HwStage);
 /// Bounded in-process cache of decompressed containers. Pipeline records
 /// often share a shader, and the key pass and make pass need the same bytes.
 /// Do not hold the mutex while decompressing; racing misses are harmless.
+type ContainerMap = HashMap<(usize, usize), Arc<[u8]>>;
+
 struct Containers {
     limit: usize,
-    state: Mutex<(usize, HashMap<(usize, usize), Arc<[u8]>>)>,
+    state: Mutex<(usize, ContainerMap)>,
 }
 
 impl Containers {
@@ -50,7 +52,7 @@ impl Containers {
         if let Some(existing) = state.1.get(&key) {
             return Some(existing.clone());
         }
-        if bytes.len() <= self.limit.saturating_sub(state.0) {
+        if self.limit != 0 && bytes.len() <= self.limit.saturating_sub(state.0) {
             state.0 += bytes.len();
             state.1.insert(key, bytes.clone());
         }

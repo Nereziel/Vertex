@@ -994,9 +994,10 @@ struct Scratch(Vec<u8>);
 impl Scratch {
     fn new(len: usize) -> Self {
         let mut bytes = SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+        // Returned buffers are cleared. Resizing initializes the entire
+        // requested range, including bytes a short decode may leave alone.
+        bytes.clear();
         bytes.resize(len, 0);
-        // The old paths used vec![0; len], including short decodes.
-        bytes.fill(0);
         Self(bytes)
     }
 }
