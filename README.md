@@ -116,7 +116,12 @@ are in [docs/test-runs.md](docs/test-runs.md).
    and parallel WriteWatch (plus `-Tuned`). Individual environment overrides
    still win; omit the switch to return to the default. The combined profile
    is not yet benchmarked and should not be treated as a proven FPS gain.
-5. **Change one setting at a time**, set before the start
+5. **Try the second-stage performance experiments** with `-PerformanceLab`
+   instead of `-FastStreaming` first. It enables the switches below for
+   identical mappings, both copy lanes, adaptive texture time slices,
+   redundant fixed-function state calls, asynchronous submission and live
+   PSO sharing. The two profiles can be combined after individual tests.
+6. **Change one setting at a time**, set before the start
    (`$env:NAME = 'value'`):
 
 | Variable | Effect |
@@ -129,6 +134,12 @@ are in [docs/test-runs.md](docs/test-runs.md).
 | `VICTORY_WIDE_TEXTURES=1` | parallel submission-time texture checks and detiling; experimental |
 | `VICTORY_XMEM_PERSISTENT_VIEW=1` | reuse physical-page section mappings instead of mapping and unmapping on every write; experimental |
 | `VICTORY_DSTORAGE_WORKERS=<n>` | limit the existing parallel read/decode pool to at most this many logical processors; unset uses all available processors. Try fewer workers if rendering threads are starved |
+| `VICTORY_XMEM_SKIP_SAME=1` | skip remapping only when the known section and offset match on every requested page; experimental, may save nothing if mappings rarely repeat |
+| `VICTORY_QUEUE2=3` | use both existing copy lanes (readback and upload); default `1` is readback only; `0` disables both |
+| `VICTORY_TEXTURE_ADAPTIVE=1` | limit the foreground texture pass based on backlog and the observed interval between passes; background worker gets a longer slice; not a GPU utilisation measurement |
+| `VICTORY_SKIP_STATE_CALLS=1` | omit identical blend, stencil and depth bounds values within one command list; experimental |
+| `VICTORY_ASYNC_SUBMIT=1` | prepare and submit on the existing submission worker; falls back if the worker cannot start |
+| `VICTORY_PSO_SHARE=1` | reuse live pending PSOs by pipeline key (weak references); does not keep released PSOs resident |
 | `VICTORY_WATCH_APART=1` | experimental parallel WriteWatch queries for disjoint pages; off by default. Compare the same warm-cache scene with `0` and `1`; disable if geometry, textures or stability regress |
 | `VICTORY_SHADER_OPT=0` | no clean-up of translated shaders: try it if you see black blocks. Everything is translated again |
 | `VICTORY_BVH_BUILDER=1` | asks for ray tracing. Slow (about 4 fps), and not tested with the merged build apart from one run that hung |
@@ -143,6 +154,10 @@ median and 90th-percentile frame time, and DirectStorage failures. Test
 individually before attributing a change to the combined profile. DirectStorage
 workers already decode in parallel; this fork reuses bounded scratch buffers
 and avoids repeated allocations without changing completion ordering.
+For `-PerformanceLab`, also compare remapping time, copy-lane bytes and
+waits, texture backlog, submission preparation time, and library loads
+versus actual PSO creations. Test switches individually with the same cache;
+none of the experimental combinations has a measured speedup in this fork.
 
 ## When something goes wrong
 
