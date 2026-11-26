@@ -763,6 +763,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
+        if count != 0 {
+            with_state(this, |list, state| state.indirect_boundary(list));
+        }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
@@ -879,9 +882,13 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
-        && !gpu_buffer_copy(list, to, from, len as usize)
     {
-        list.defer_copy(to, from, len as usize);
+        if len != 0 {
+            with_state(this, |list, state| state.indirect_boundary(list));
+        }
+        if !gpu_buffer_copy(list, to, from, len as usize) {
+            list.defer_copy(to, from, len as usize);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -984,6 +991,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
+            if a.min(b) != 0 {
+                with_state(this, |list, state| state.indirect_boundary(list));
+            }
             if !gpu_buffer_copy(list, to, from, a.min(b) as usize) {
                 list.defer_copy(to, from, a.min(b) as usize);
             }
@@ -1655,7 +1665,12 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    with_state(this, |list, state| state.indirect_boundary(list));
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -2205,6 +2220,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
+        with_state(this, |list, state| state.indirect_boundary(list));
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
