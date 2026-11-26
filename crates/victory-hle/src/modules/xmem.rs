@@ -1136,6 +1136,29 @@ fn merged(mut pieces: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     runs
 }
 
+// Experimental: avoid disturbing a mapping that already shows precisely the
+// requested physical pages. Compare section identity and offset, not just
+// the virtual address. Keep the original path for any unknown page.
+fn skip_same_mapping() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_XMEM_SKIP_SAME").is_some_and(|v| v == "1"))
+}
+
+fn mapped_slice(physical: &Physical, at: usize) -> Option<(&Slice, usize)> {
+    let (&base, (size, slice)) = physical.views.range(..=at).next_back()?;
+    (at - base < *size).then(|| (slice, slice.index + (at - base) / PAGE))
+}
+
+fn same_pages(physical: &Physical, base: usize, pages: &[usize]) -> bool {
+    pages.iter().enumerate().all(|(i, page)| {
+        let Some(at) = i.checked_mul(PAGE).and_then(|n| base.checked_add(n)) else { return false; };
+        let Some(want) = physical.pages.get(page) else { return false; };
+        mapped_slice(physical, at).is_some_and(|(have, index)| {
+            Arc::ptr_eq(&have.section, &want.section) && index == want.index
+        })
+    })
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -1145,6 +1168,13 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
+    if skip_same_mapping() && !pages.is_null() && base % PAGE == 0 {
+        // SAFETY: same page array the normal mapping path reads below.
+        let requested = unsafe { std::slice::from_raw_parts(pages, n) };
+        if same_pages(&physical, base, requested) {
+            return address;
+        }
+    }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
@@ -1219,6 +1249,17 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    if skip_same_mapping() && from != 0 && to % PAGE == 0 && from % PAGE == 0 && len % PAGE == 0
+        && (0..len).step_by(PAGE).all(|k| {
+            let (Some(src), Some(dst)) = (from.checked_add(k), to.checked_add(k)) else { return false; };
+            match (mapped_slice(&physical, src), mapped_slice(&physical, dst)) {
+                (Some((a, ai)), Some((b, bi))) => Arc::ptr_eq(&a.section, &b.section) && ai == bi,
+                _ => false,
+            }
+        })
+    {
+        return true;
+    }
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let (start, end) = reach(&physical, to, len);
     let _changing = victory_gpu::title_memory_remapping(start, end - start);
@@ -2063,6 +2104,22 @@ mod tests {
         // guess, which is the direction that keeps a run on the proven path.
         let lone_surrogate = OsString::from_wide(&[0xd800]);
         assert!(!parse_persistent_views(Some(lone_surrogate.as_os_str())));
+    }
+
+    #[test]
+    fn identical_mapping_checks_section_and_page_offset() {
+        let pages = allocate(3);
+        let section = slice_of(pages[0]);
+        let mut p = Physical::default();
+        for &page in &pages { p.pages.insert(page, slice_of(page)); }
+        let base = PAGE * 32;
+        p.views.insert(base, (PAGE * 3, section));
+        assert!(same_pages(&p, base, &pages));
+        assert!(same_pages(&p, base + PAGE, &pages[1..]));
+        assert!(!same_pages(&p, base, &pages[1..]));
+        assert!(!same_pages(&p, base + PAGE * 3, &pages[..1]));
+        assert!(!same_pages(&p, base, &[0]));
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 
     #[test]
