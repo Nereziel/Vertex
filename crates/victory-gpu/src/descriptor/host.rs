@@ -13,9 +13,66 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+// The made keys and their writer locks are already sharded in Vertex.
+// Apply the other half of fxceless/victory-fork 5d659e0: independently
+// retained resources need not serialize all recording threads on one lock.
+// Adjacent slots belong to different shards; no extra slot storage.
+const KEPT_SHARDS: usize = 64;
+
+struct Kept<T> {
+    shards: [Mutex<Vec<Option<T>>>; KEPT_SHARDS],
+}
+
+impl<T> Kept<T> {
+    fn new(count: usize) -> Self {
+        Self {
+            shards: std::array::from_fn(|shard| {
+                let len = count.saturating_sub(shard).div_ceil(KEPT_SHARDS);
+                Mutex::new(std::iter::repeat_with(|| None).take(len).collect())
+            }),
+        }
+    }
+
+    fn with<R>(&self, index: u32, f: impl FnOnce(Option<&T>) -> R) -> R {
+        let index = index as usize;
+        let kept = self.shards[index % KEPT_SHARDS].lock().unwrap_or_else(|e| e.into_inner());
+        f(kept.get(index / KEPT_SHARDS).and_then(Option::as_ref))
+    }
+
+    fn replace(&self, index: u32, resource: Option<T>) -> Option<T> {
+        let index = index as usize;
+        let mut kept = self.shards[index % KEPT_SHARDS].lock().unwrap_or_else(|e| e.into_inner());
+        kept.get_mut(index / KEPT_SHARDS).and_then(|slot| std::mem::replace(slot, resource))
+    }
+}
+
+#[cfg(test)]
+mod kept_tests {
+    use super::Kept;
+
+    #[test]
+    fn sharded_retention_preserves_slot_identity_and_bounds() {
+        let kept = Kept::new(133);
+        for index in 0..133u32 {
+            assert_eq!(kept.replace(index, Some(index)), None);
+        }
+        for index in 0..133u32 {
+            assert_eq!(kept.with(index, |v| v.copied()), Some(index));
+        }
+        assert_eq!(kept.replace(64, Some(999)), Some(64));
+        assert_eq!(kept.replace(64, None), Some(999));
+        assert_eq!(kept.with(64, |v| v.copied()), None);
+        assert_eq!(kept.with(0, |v| v.copied()), Some(0));
+        assert_eq!(kept.with(128, |v| v.copied()), Some(128));
+        assert_eq!(kept.replace(133, Some(999)), None);
+        assert_eq!(kept.with(133, |v| v.copied()), None);
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -43,7 +100,7 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    kept: Kept<ID3D12Resource>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1052,6 +1109,7 @@ impl HostHeap {
         let h = HostHeap {
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
@@ -1059,7 +1117,7 @@ impl HostHeap {
             made: Made::new(count as usize),
             copied: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             nulls: (0..if sampler { 0 } else { count }).map(|_| std::sync::atomic::AtomicU8::new(0)).collect(),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: Kept::new((count + extra) as usize),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1401,12 +1459,7 @@ impl HostHeap {
         // as `mirror` takes them.
         let _hold = self.made.hold(index);
         self.made.get(index).is_some_and(|made| made != 0 && made == key)
-            && self
-                .kept
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(index as usize)
-                .is_some_and(Option::is_some)
+            && self.kept.with(index, |resource| resource.is_some())
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -1805,13 +1858,10 @@ impl HostHeap {
         if let Some(null) = self.nulls.get(index as usize) {
             null.store(0, std::sync::atomic::Ordering::Relaxed);
         }
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            // A running submission may still read the old resource through
-            // this slot.
-            if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
-            }
+        // Keep the previous resource alive until the same retirement
+        // machinery says it can go; do not take its lock under a shard.
+        if let Some(old) = self.kept.replace(index, resource) {
+            crate::host::retire(old);
         }
     }
 
@@ -1911,10 +1961,9 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        // The shader-visible base handle is fixed for this heap's lifetime.
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 
@@ -2061,6 +2110,7 @@ impl HostHeap {
     ) -> u64 {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
+        let mut tabled = 0u64;
         for index in slots {
             let handle = start + index * step;
             let mut whole = [0u8; 32];
@@ -2086,7 +2136,7 @@ impl HostHeap {
             // A table's slot lately: left to its draws, and looked at
             // again next time.
             if !tables && self.tabled_lately(index as u32, frame) {
-                COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tabled += 1;
                 continue;
             }
             let words = |at: usize| u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
@@ -2096,6 +2146,9 @@ impl HostHeap {
             }
             last.store(print, std::sync::atomic::Ordering::Relaxed);
             due.push((index as u32, handle, words));
+        }
+        if tabled != 0 {
+            COPIED_TABLED.fetch_add(tabled, std::sync::atomic::Ordering::Relaxed);
         }
         looked
     }
@@ -2343,9 +2396,9 @@ impl HostHeap {
     /// that is brought up to date for it).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let shown = kept.get(index as usize)?.as_ref()?;
-        Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+        self.kept.with(index, |shown| {
+            shown.map(|shown| windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+        })
     }
 
     /// What the queue of textures picked by index knows of title slot
@@ -3235,6 +3288,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            // Null/empty CBVs use the existing null descriptor path;
+            // never look for a live shadow at address zero or size zero.
+            if address == 0 || size == 0 {
+                return None;
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {

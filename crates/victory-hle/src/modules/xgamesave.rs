@@ -178,14 +178,16 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
 }
 
 /// The container's newest committed version, if any. Removes what a crash
-/// left: unfinished versions and older ones.
+/// left: unfinished versions and older ones, as far as they can be removed.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(dir = %entry.path().display(), %e, "an unfinished save version stays for now");
+            }
         } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
             committed.push(n);
         }
@@ -194,8 +196,12 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let Some(&number) = committed.last() else {
         return Ok(None);
     };
+    // Failure to clean up an old version must not hide the newest commit.
     for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+        let path = dir.join(format!("v{old}"));
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            tracing::info!(dir = %path.display(), %e, "an older save version stays for now");
+        }
     }
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
@@ -1000,6 +1006,24 @@ mod tests {
         let blobs = read(&c, None).unwrap();
         let text = |(n, d): (String, Vec<u8>)| (n, String::from_utf8(d).unwrap());
         Some((display, blobs.into_iter().map(text).collect()))
+    }
+
+    #[test]
+    fn a_locked_older_save_does_not_block_newer_saves() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = container_dir(root.path(), "Slot");
+        assert_eq!(update(root.path(), "one", &[("a", Some("first"))]), S_OK);
+        let first = current(&dir).unwrap().unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(first.blob(0)).unwrap();
+        assert_eq!(update(root.path(), "two", &[("a", Some("second"))]), S_OK);
+        assert_eq!(state(root.path()), Some(("two".into(), vec![("a".into(), "second".into())])));
+        assert_eq!(update(root.path(), "three", &[("a", Some("third"))]), S_OK);
+        assert_eq!(state(root.path()), Some(("three".into(), vec![("a".into(), "third".into())])));
+        assert!(first.blob(0).exists());
+        drop(held);
+        assert!(current(&dir).unwrap().is_some());
+        assert!(!first.dir.exists());
     }
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {

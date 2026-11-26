@@ -109,7 +109,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 1. **Close other programs**, browsers first. With little memory free, freezes
    get longer.
 2. **Run twice.** The second start uses the shaders and pipelines of the first.
-3. **Try the faster submission settings:** `.\start.ps1 -GameExe <exe> -Tuned`
+3. **Use `-Release` for FPS measurements** (optimized release build, no diagnostics); keep the default diagnostic build for investigating faults. Try the faster submission settings: `.\start.ps1 -GameExe <exe> -Tuned`
 4. **Change one setting at a time**, set before the start
    (`$env:NAME = 'value'`):
 
@@ -117,11 +117,16 @@ are in [docs/test-runs.md](docs/test-runs.md).
 |---|---|
 | `VICTORY_TEXTURE_SHARE=33` | the share of each frame, in percent, the texture pass may take. Lower: smoother, textures come in later. `0`: no limit, as before |
 | `VICTORY_TEXTURE_STAGE_MS=250` | the most that pass may take in any case, in ms (three times that with a large backlog) |
+| `VICTORY_CARD_SYNC_BATCH=1` | experimental: record card uploads, their resource transitions, and the existing hash dispatches in three phases (adapted from fxceless/victory-fork 6aed078). Default off; repeated destination resources fall back to original order. Test separately. |
+| `VICTORY_WATCH_APART=1` | experimental upstream parallel write-watch queries on disjoint 64 KiB page ranges; off by default. Test separately before combining with other memory experiments. |
+| `VICTORY_PERF_CAPTION=1` | extended window title performance display: FPS, frame time, CPU submission preparation, estimated queue busy percentage, pending PSOs, drops and DXGI memory usage/budget. Updated once per second; not an in-frame overlay. Off by default. |
+| `VICTORY_ADAPTIVE_TEXTURE_FLOOR=1` | experimental: cap the unconditional texture allowance at one third of the initial DXGI local memory budget (never above 2 GiB); default off. The live usage checks and manual budget override remain unchanged. |
 | `VICTORY_TEXTURE_BUDGET_MB=<n>` | at most this much card memory for those textures: less pressure on memory, blurrier picture |
+| `VICTORY_CHANGED_RUNS=1` | experimental SSE2 comparison of exact changed byte ranges, 64 bytes at a time; off by default, `0` restores the original path. Does not change shaders or widen writes. Benchmark with the same save and warm cache. |
 | `VICTORY_CARD_BUFFERS_MB`, `VICTORY_CARD_WINDOWS_MB` | how much of the title's memory is copied to the card (`VICTORY_CARD_WINDOWS_MB=0`: no windows) |
 | `VICTORY_SHADER_OPT=0` | no clean-up of translated shaders: try it if you see black blocks. Everything is translated again |
 | `VICTORY_BVH_BUILDER=1` | asks for ray tracing. Slow (about 4 fps), and not tested with the merged build apart from one run that hung |
-| `--work cpu`, `balanced`, `gpu` (`victory run`) | where work is done that both sides can do; `balanced` is the measured choice and the launcher's default |
+| `--work cpu`, `balanced`, `gpu`, `auto` (`victory run`) | where work is done that both sides can do; `balanced` remains the launcher's default. `auto` is experimental: balanced settings plus exact SIMD comparisons and adaptive texture floor. The normal 1 MiB card-buffer minimum is unchanged (manual VICTORY_CARD_BUFFERS_MIN_KB still works). Existing manual overrides win; no translator switches are changed. |
 
 More switches are described in comments where the code reads them.
 

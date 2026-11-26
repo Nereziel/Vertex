@@ -165,7 +165,7 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1024).
 /// `VICTORY_CARD_BUFFERS_MIN_KB` names the smallest in KiB instead, below
 /// 1 MiB too (0: every title buffer): run int-k-2's world has 3,604 title
 /// buffers under 1 MiB, 42 MB in all, that shaders read over the bus.
@@ -464,16 +464,22 @@ fn sent_over(ranges: &[(usize, usize)], from: usize, to: usize) -> &[(usize, usi
 }
 
 /// Ranges in order, those that overlap or touch as one.
-fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+pub(crate) fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    // Compact the sorted input in its existing allocation. The written
+    // prefix never reaches beyond the current input index.
+    let mut kept = 0;
+    for i in 0..ranges.len() {
+        let (from, to) = ranges[i];
+        if kept > 0 && from <= ranges[kept - 1].1 {
+            ranges[kept - 1].1 = ranges[kept - 1].1.max(to);
+        } else {
+            ranges[kept] = (from, to);
+            kept += 1;
         }
     }
-    out
+    ranges.truncate(kept);
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -483,17 +489,20 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// so a piece that held several ranges was hashed once for each.
 pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
     runs.sort_unstable_by_key(|r| r.first);
-    let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
-    for run in runs {
-        match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
-                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
-                last.to = last.to.max(run.to);
-            }
-            _ => out.push(run),
+    let mut kept = 0;
+    for i in 0..runs.len() {
+        let run = runs[i];
+        if kept > 0 && run.first <= runs[kept - 1].first + runs[kept - 1].pieces {
+            let last = &mut runs[kept - 1];
+            last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+            last.to = last.to.max(run.to);
+        } else {
+            runs[kept] = run;
+            kept += 1;
         }
     }
-    out
+    runs.truncate(kept);
+    runs
 }
 
 /// A declared range of a copy in the card's memory, as the compare on the
@@ -693,6 +702,27 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn joined_ranges_reuse_storage_and_keep_exact_coverage() {
+        // Exhaust all subsets of a small set of overlapping, adjacent,
+        // duplicate and disjoint ranges in reverse input order.
+        let cases = [(0, 2), (1, 3), (3, 5), (7, 8), (0, 2), (9, 12), (4, 10), (12, 13)];
+        for mask in 0..(1 << cases.len()) {
+            let mut input: Vec<_> = cases.iter().enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, &r)| r).rev().collect();
+            let mut want: Vec<_> = input.iter().flat_map(|&(a, b)| a..b).collect();
+            want.sort_unstable();
+            want.dedup();
+            input.reserve(16);
+            let ptr = input.as_ptr();
+            let got = joined(input);
+            assert_eq!(got.as_ptr(), ptr);
+            assert!(got.windows(2).all(|w| w[0].1 < w[1].0));
+            assert_eq!(got.iter().flat_map(|&(a, b)| a..b).collect::<Vec<_>>(), want);
+        }
     }
 }
 
@@ -1987,6 +2017,17 @@ fn dword_runs(runs: Vec<(usize, usize)>, lo: usize, n: usize) -> Vec<(usize, usi
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    // Keep the known-good path by default until A/B runs on Vertex
+    // confirm the benefit. Both implementations return exact byte runs.
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *WIDE.get_or_init(|| std::env::var_os("VICTORY_CHANGED_RUNS").is_some_and(|v| v == "1")) {
+        changed_runs_wide(now, was)
+    } else {
+        changed_runs_bytes(now, was)
+    }
+}
+
+fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2008,6 +2049,125 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         runs.push((first, i - first));
     }
     runs
+}
+
+/// [`changed_runs`] 64 bytes at a time: one mask of the bytes that differ
+/// (four 16-byte compares), and the runs read off the masks. Every byte is
+/// read once. Timed on 48 MB against the walk (2026-11-25, this PC): all
+/// equal 4.3 against 4.3 ms; all differing 4 against 12; one byte in 64
+/// differing 14 against 21; 12 of every 16 differing 24 against 34. (A form
+/// that compared 64 equal bytes and then walked eight at a time was slower
+/// than the walk in the last two, by a fifth: it never ran in a game.)
+#[cfg(target_arch = "x86_64")]
+fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    let n = now.len().min(was.len());
+    let (now, was) = (&now[..n], &was[..n]);
+    // Do not allocate for the common all-equal case.
+    let mut runs = Vec::new();
+    // The first byte of a run not yet ended.
+    let mut open: Option<usize> = None;
+    let mut base = 0;
+    while base + 64 <= n {
+        // Bit `k`: byte `base + k` differs.
+        let mut differ = 0u64;
+        for part in 0..4 {
+            let at = base + 16 * part;
+            // SAFETY: `at + 16 <= base + 64 <= n`, the length of both
+            // slices; the loads are unaligned ones. SSE2 is part of x86-64.
+            let equal = unsafe {
+                let a = _mm_loadu_si128(now.as_ptr().add(at).cast::<__m128i>());
+                let b = _mm_loadu_si128(was.as_ptr().add(at).cast::<__m128i>());
+                _mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) as u32 & 0xffff
+            };
+            differ |= u64::from(!equal & 0xffff) << (16 * part);
+        }
+        if differ == 0 {
+            if let Some(first) = open.take() {
+                runs.push((first, base - first));
+            }
+        } else if differ != u64::MAX || open.is_none() {
+            let mut at = 0u32;
+            while at < 64 {
+                match open {
+                    None => {
+                        // The next byte that differs, if any.
+                        let skip = (differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        open = Some(base + at as usize);
+                    }
+                    Some(first) => {
+                        // The next byte that is equal, if any.
+                        let skip = (!differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        runs.push((first, base + at as usize - first));
+                        open = None;
+                    }
+                }
+            }
+        }
+        base += 64;
+    }
+    for i in base..n {
+        match (open, now[i] != was[i]) {
+            (None, true) => open = Some(i),
+            (Some(first), false) => {
+                runs.push((first, i - first));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(first) = open {
+        runs.push((first, n - first));
+    }
+    runs
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    changed_runs_bytes(now, was)
+}
+
+#[cfg(test)]
+mod changed_runs_wide_tests {
+    use super::{changed_runs_bytes, changed_runs_wide};
+
+    #[test]
+    fn wide_matches_scalar_at_boundaries_and_unaligned_addresses() {
+        for n in [0usize, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 191, 192, 193, 4095, 4096, 4097] {
+            for shift in [0usize, 1, 7, 15] {
+                let old = vec![7u8; n + shift];
+                for pattern in 0..6 {
+                    let mut new = old.clone();
+                    for (i, b) in new[shift..].iter_mut().enumerate() {
+                        if match pattern {
+                            0 => false,
+                            1 => true,
+                            2 => i % 2 == 0,
+                            3 => i % 64 == 63 || i % 64 == 0,
+                            4 => i >= 31 && i < 160,
+                            _ => i % 97 < 12,
+                        } {
+                            *b ^= 0x41;
+                        }
+                    }
+                    assert_eq!(
+                        changed_runs_wide(&new[shift..], &old[shift..]),
+                        changed_runs_bytes(&new[shift..], &old[shift..]),
+                        "n={n}, shift={shift}, pattern={pattern}"
+                    );
+                }
+            }
+        }
+        assert_eq!(changed_runs_wide(&[1, 2, 3, 4], &[1, 0]), vec![(1, 1)]);
+    }
 }
 
 /// The step a refresh that compares ([`refresh_compare`]) takes or leaves

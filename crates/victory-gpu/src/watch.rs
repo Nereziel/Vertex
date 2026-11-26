@@ -136,6 +136,12 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    let _gate = GATE.write().unwrap_or_else(|e| e.into_inner());
+    ask_ahead_gated(ranges);
+}
+
+/// [`ask_ahead`] for a caller that holds [`GATE`] for writing.
+fn ask_ahead_gated(ranges: &[(usize, usize)]) {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
@@ -298,8 +304,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 
 /// [`ask_once`]; with `views` the guards are asked too ([`ask_views`]).
 fn ask_now(ranges: &[(usize, usize)], views: bool) {
+    let _gate = GATE.write().unwrap_or_else(|e| e.into_inner());
     ask_once_end();
-    ask_ahead(ranges);
+    ask_ahead_gated(ranges);
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -511,6 +518,9 @@ pub(crate) fn writes_into(
             return Some(j.ahead_asked);
         }
     }
+    if apart() {
+        return writes_apart(start, end, guarded, written);
+    }
     let mut journal = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     let j = &mut *journal;
     if j.stands(first, last, guarded) {
@@ -592,6 +602,159 @@ pub(crate) fn writes_into(
     }
     written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
     Some(now)
+}
+
+/// Whether askings about different pages go to the kernel side by side
+/// (`VICTORY_WATCH_APART=1`; off by default). Measured in run 27 (open
+/// world, diagnostics build): the submitting thread stood 20 ms a frame,
+/// and the wide workers 209 ms between them, waiting for the journal's
+/// lock, which [`writes_into`] held across the kernel's answer and the
+/// guards'. Here only the pages in question are held ([`Claim`]), and the
+/// journal only while the answer goes in.
+fn apart() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_APART").is_some_and(|v| v == "1"))
+}
+
+/// Askings about pages under way side by side ([`writes_apart`]) hold it for
+/// reading; one that asks for a submission's ranges and makes them stand
+/// ([`ask_ahead`], [`ask_once`]) holds it for writing, so that no answer is
+/// missing from the journal when it stands. Taken before [`JOURNAL`].
+static GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// The 64 KiB pages (also the guards' blocks) being asked about.
+static IN_FLIGHT: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+static LANDED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Pages `[first, last)` held for one asking: the kernel's answer clears the
+/// written state it reports, and a guard taken again forgets it, so a
+/// second asking about one of these pages before the first answer is in
+/// the journal would see neither. Askings about other pages go on.
+struct Claim(usize, usize);
+
+impl Claim {
+    fn take(first: usize, last: usize) -> Claim {
+        let mut held = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        while held.iter().any(|&(a, b)| a < last && first < b) {
+            held = LANDED.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.push((first, last));
+        Claim(first, last)
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut held = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = held.iter().position(|&r| r == (self.0, self.1)) {
+            held.swap_remove(at);
+        }
+        drop(held);
+        LANDED.notify_all();
+    }
+}
+
+/// What the kernel or the guards said of pages `[first, last)`.
+enum Answer {
+    /// Kernel pages (addresses) and guarded pages (64 KiB page numbers).
+    Written(Vec<usize>, Vec<usize>),
+    /// Neither watched nor a view.
+    Unwatched,
+    /// A view block turned out to be private memory: ask again.
+    Again,
+}
+
+/// The kernel's and the guards' answer for `[first, last)`, without the
+/// journal (as [`writes_into`] asks them).
+fn answer(first: usize, last: usize, guarded: bool) -> Answer {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let view = guarded && known_view(first * PAGE);
+    let mut found: Vec<usize> = Vec::new();
+    let failed = view || {
+        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        found.resize(count, 0);
+        let mut granularity = 0;
+        // SAFETY: the answer buffer holds `count` entries.
+        let status = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        found.truncate(count);
+        status != 0
+    };
+    if !failed {
+        return Answer::Written(found, Vec::new());
+    }
+    if !guarded {
+        return Answer::Unwatched;
+    }
+    match guard(first * PAGE, last * PAGE, view) {
+        Some(pages) => Answer::Written(Vec::new(), pages),
+        None if view => Answer::Again,
+        None => Answer::Unwatched,
+    }
+}
+
+/// The journal told what `kernel` (addresses) and `pages` (page numbers)
+/// say was written, at a new asking; what it holds of `[first, last)` put
+/// into `written`; that asking's number.
+fn note(first: usize, last: usize, kernel: Vec<usize>, pages: Vec<usize>, written: &mut Vec<(usize, u64)>) -> u64 {
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    for at in kernel {
+        j.written.insert(at / PAGE, now);
+    }
+    for page in pages {
+        j.written.insert(page, now);
+    }
+    written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+    now
+}
+
+/// Tests: microseconds put between the kernel's answer and the journal.
+#[cfg(test)]
+static WIDEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// [`writes_into`] with only the pages in question held while the kernel
+/// and the guards answer ([`apart`]).
+fn writes_apart(start: usize, end: usize, guarded: bool, written: &mut Vec<(usize, u64)>) -> Option<u64> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // A second time if a view block turned out to be private memory (the
+    // guards have forgotten it, so it is asked about as other memory), as
+    // [`writes_into`] asks again.
+    for _ in 0..2 {
+        let _gate = GATE.read().unwrap_or_else(|e| e.into_inner());
+        let _claim = Claim::take(first, last);
+        {
+            // Asked about while this waited for its pages.
+            let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+            if j.stands(first, last, guarded) {
+                written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+                return Some(j.ahead_asked);
+            }
+        }
+        let said = answer(first, last, guarded);
+        // Tests widen the time between the answer and the journal, where a
+        // second asking about the same pages would miss what this one found.
+        #[cfg(test)]
+        if let Some(us) = WIDEN.get() {
+            std::thread::sleep(std::time::Duration::from_micros(*us));
+        }
+        match said {
+            Answer::Written(kernel, pages) => return Some(note(first, last, kernel, pages, written)),
+            Answer::Unwatched => return None,
+            Answer::Again => {}
+        }
+    }
+    None
 }
 
 /// Diagnostics: one in 2,048 of the askings the kernel's write watch
@@ -1048,11 +1211,20 @@ fn protect_aliases(g: &mut Guards, block: usize) {
     }
     #[cfg(feature = "diagnostics")]
     ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    for alias in shown {
-        let alias = alias / BLOCK;
+    let mut all_guarded = g.protected.contains(&block);
+    for &address in &shown {
+        let alias = address / BLOCK;
         g.aliased.insert(alias);
         if alias != block {
-            protect_alias(g, alias);
+            all_guarded &= protect_alias(g, alias);
+        }
+    }
+    if !all_guarded {
+        // Marvisak/VIctory #2455: an unprotected alias can write without
+        // a fault. Do not mark any view of this page clean.
+        g.clean.remove(block);
+        for address in shown {
+            g.clean.remove(address / BLOCK);
         }
     }
 }
@@ -1081,10 +1253,10 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// reports a block that is read-only and not clean as written, then notes it
 /// clean). A block that is clean stays so: had the pages been written since
 /// its copies took them, `open` would have opened it.
-fn protect_alias(g: &mut Guards, block: usize) {
+fn protect_alias(g: &mut Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     if g.protected.contains(&block) {
-        return;
+        return true;
     }
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
@@ -1093,6 +1265,9 @@ fn protect_alias(g: &mut Guards, block: usize) {
         if view_known() {
             g.viewed.insert(block);
         }
+        true
+    } else {
+        false
     }
 }
 
@@ -1885,6 +2060,48 @@ mod tests {
         super::guard(start, end, known_view(start))
     }
 
+    /// Threads that write pages and ask at the same time, about ranges that
+    /// overlap: each sees its own write in every answer that follows it,
+    /// whichever thread's asking cleared the kernel's bit (with
+    /// `VICTORY_WATCH_APART=1` the askings go side by side).
+    #[test]
+    fn askings_side_by_side_lose_no_write() {
+        const PAGES: usize = 16;
+        // A second asking between an answer and its entry would find the
+        // kernel's bits cleared and the journal not told yet.
+        let _ = WIDEN.set(300);
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        std::thread::scope(|s| {
+            for t in 0..8usize {
+                s.spawn(move || {
+                    let mut written = Vec::new();
+                    for i in 0..300usize {
+                        let page = (t * 2 + i) % PAGES;
+                        // SAFETY: committed pages of ours.
+                        unsafe { ((p + page * PAGE + t * 8) as *mut u64).write_volatile(i as u64) };
+                        // A range that holds the page, of one to six pages.
+                        let len = 1 + (i + t) % 6;
+                        let from = page.saturating_sub(i % len).min(PAGES - len);
+                        let now = writes_into(p + from * PAGE, p + (from + len) * PAGE, false, &mut written)
+                            .expect("watched");
+                        let mine = p / PAGE + page;
+                        assert!(
+                            written.iter().any(|&(q, w)| q == mine && w <= now),
+                            "thread {t}, step {i}: page {page} written and not reported"
+                        );
+                    }
+                });
+            }
+        });
+        // Kept to the end of the process: the journal remembers these pages
+        // as written, and another test given the same addresses would find
+        // them there.
+    }
+
     #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
@@ -2316,6 +2533,24 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A failed protection on an alias must not make its page clean.
+    #[test]
+    fn a_page_with_an_unprotectable_alias_stays_dirty() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
+        let (section, one, two) = two_views(BLOCK);
+        // SAFETY: a private reservation, deliberately not committed.
+        let absent = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(absent, 0);
+        crate::inplace::title_memory_view(absent, BLOCK, section, 0);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]),
+            "the other alias is not protected");
+        title_memory_remapped(absent, BLOCK);
+        // SAFETY: release the independent reservation above.
+        unsafe { VirtualFree(absent as *mut _, 0, MEM_RELEASE) };
+        drop_views(section, &[one, two], BLOCK);
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the

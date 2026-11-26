@@ -314,19 +314,6 @@ impl GraphicsState {
     }
 }
 
-fn integer_rtv(format: DXGI_FORMAT) -> bool {
-    matches!(format,
-        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT
-            | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT
-            | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16B16A16_SINT
-            | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT | DXGI_FORMAT_R10G10B10A2_UINT
-            | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R8G8B8A8_SINT
-            | DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT
-            | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_SINT
-            | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_SINT
-    )
-}
-
 /// One input element: vertex buffer slot, byte offset, format.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Input {
@@ -450,18 +437,21 @@ impl HostPipeline {
         }
         let host = host()?;
 
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        // SAFETY: the feature query writes the structure of the given size.
-        // Older runtimes may not recognize OPTIONS19; that means no support.
-        let aniso_point_mip_supported = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS19,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        }
-        .is_ok()
-            && options.AnisoFilterWithPointMipSupported.as_bool();
+        // Host is a process-wide, immutable device. Query its capability
+        // once, even when thousands of cached pipelines are opened.
+        static ANISO_POINT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let aniso_point_mip_supported = *ANISO_POINT.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+            // SAFETY: writes the feature structure of the given size.
+            // Older runtimes may not recognize OPTIONS19.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS19,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }.is_ok() && options.AnisoFilterWithPointMipSupported.as_bool()
+        });
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -594,6 +584,11 @@ impl HostPipeline {
                 return None;
             }
         };
+        // Borrow the bytes the pipeline description points at. Library
+        // names still hash the same length-prefixed byte strings.
+        let code_bytes = |i: usize| -> &[u8] {
+            stages.get(i).and_then(|(s, _)| s.translated()).map_or(&[][..], |t| t.host.dxil.as_slice())
+        };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -610,7 +605,7 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name("compute", &root_blob, &[code_bytes(0)], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -673,6 +668,10 @@ impl HostPipeline {
                 Some(pair) => (bytecode(&pair.0.dxil), bytecode(&pair.1.dxil)),
                 None => (code(0), code(1)),
             };
+            let (ms_bytes, ps_bytes) = match &pair {
+                Some(pair) => (pair.0.dxil.as_slice(), pair.1.dxil.as_slice()),
+                None => (code_bytes(0), code_bytes(1)),
+            };
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
@@ -680,7 +679,7 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh triangles",
                 &root_blob,
-                &[&code_bytes(&ms_code), &code_bytes(&ps_code)],
+                &[ms_bytes, ps_bytes],
                 &state,
             );
             let pso = match mesh_pipeline(&host.device, &root, ms_code, ps_code, g, depth_bounds, &name) {
@@ -759,13 +758,13 @@ impl HostPipeline {
             Some(gs) => super::library::name(
                 "graphics rectangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &[code_bytes(0), code_bytes(1), &gs[..]],
                 &state,
             ),
             None => super::library::name(
                 "graphics",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[code_bytes(0), code_bytes(1)],
                 &state,
             ),
         };
@@ -1067,15 +1066,6 @@ fn mesh_pipeline(
     } else {
         build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth))
     }
-}
-
-/// The bytes of shader code (none for an absent stage).
-fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
-    if code.pShaderBytecode.is_null() {
-        return Vec::new();
-    }
-    // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
 fn root_signature(

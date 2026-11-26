@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -27,6 +27,42 @@ use crate::shader::{MAX_FILE, Source, sources};
 
 /// Where a native program's container is: file, source, and its stage.
 type Found = (usize, usize, HwStage);
+
+/// Bounded in-process cache of decompressed containers. Pipeline records
+/// often share a shader, and the key pass and make pass need the same bytes.
+/// Do not hold the mutex while decompressing; racing misses are harmless.
+type ContainerMap = HashMap<(usize, usize), Arc<[u8]>>;
+
+struct Containers {
+    limit: usize,
+    state: Mutex<(usize, ContainerMap)>,
+}
+
+impl Containers {
+    fn new(limit: usize) -> Self {
+        Self { limit, state: Mutex::new((0, HashMap::new())) }
+    }
+
+    fn get(&self, key: (usize, usize), load: impl FnOnce() -> Option<Arc<[u8]>>) -> Option<Arc<[u8]>> {
+        if let Some(bytes) = lock(&self.state).1.get(&key).cloned() {
+            return Some(bytes);
+        }
+        let bytes = load()?;
+        let mut state = lock(&self.state);
+        if let Some(existing) = state.1.get(&key) {
+            return Some(existing.clone());
+        }
+        if self.limit != 0 && bytes.len() <= self.limit.saturating_sub(state.0) {
+            state.0 += bytes.len();
+            state.1.insert(key, bytes.clone());
+        }
+        Some(bytes)
+    }
+
+    fn bytes(&self) -> usize {
+        lock(&self.state).0
+    }
+}
 
 /// One pipeline to make: a graphics or compute record of the pack.
 #[derive(Clone, Copy, Debug)]
@@ -130,12 +166,20 @@ pub fn run(paths: &[PathBuf], threads: usize, used_pipelines: bool) -> Result<()
         named.blend.len(),
     );
 
-    let container = |code: &[u8]| -> Option<(Vec<u8>, HwStage)> {
+    // Only the offline prebuild uses this memory; runtime shader keys,
+    // pipeline identities and the disk cache are unchanged. 0 disables it.
+    let memo_mb = std::env::var("VICTORY_PREBUILD_MEMO_MB").ok()
+        .and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(128);
+    let containers = Containers::new(memo_mb.saturating_mul(1 << 20));
+    let container = |code: &[u8]| -> Option<(Arc<[u8]>, HwStage)> {
         let &(f, i, stage) = programs.get(&shaderpack::program_id(code)?)?;
-        let bytes = sources[f][i].bytes()?;
-        // As the title passes it: the container's own size.
-        let size = u32::from_le_bytes(bytes.get(0x18..0x1c)?.try_into().ok()?) as usize;
-        Some((bytes.get(..size)?.to_vec(), stage))
+        let bytes = containers.get((f, i), || {
+            let bytes = sources[f][i].bytes()?;
+            // As the title passes it: the container's own size.
+            let size = u32::from_le_bytes(bytes.get(0x18..0x1c)?.try_into().ok()?) as usize;
+            Some(Arc::from(bytes.get(..size)?))
+        })?;
+        Some((bytes, stage))
     };
     // A job's pipeline, or why it has none.
     let prepare = |job: Job| -> Result<Prebuild, String> {
@@ -302,6 +346,7 @@ pub fn run(paths: &[PathBuf], threads: usize, used_pipelines: bool) -> Result<()
         });
     });
     pipeline::save_pipeline_cache();
+    println!("pipelines    container memo: {:.1} MiB retained (limit {memo_mb} MiB)", containers.bytes() as f64 / (1 << 20) as f64);
     let (made, loaded) = counts();
     println!(
         "pipelines    {} in the pack, {:.1} s: {made} made, {} already in the library",
@@ -348,4 +393,25 @@ fn program_ids(bytes: &[u8]) -> Vec<([u8; 24], HwStage)> {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+
+    #[test]
+    fn memo_reuses_bytes_and_respects_limit() {
+        let cache = Containers::new(4);
+        let a = cache.get((0, 0), || Some(Arc::from([1u8, 2, 3]))).unwrap();
+        let b = cache.get((0, 0), || panic!("already loaded")).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(cache.bytes(), 3);
+        let c = cache.get((1, 0), || Some(Arc::from([4u8, 5]))).unwrap();
+        assert_eq!(&*c, &[4, 5]);
+        assert_eq!(cache.bytes(), 3);
+        assert!(cache.get((2, 0), || None).is_none());
+        let disabled = Containers::new(0);
+        assert_eq!(&*disabled.get((0, 0), || Some(Arc::from([9u8]))).unwrap(), &[9]);
+        assert_eq!(disabled.bytes(), 0);
+    }
 }

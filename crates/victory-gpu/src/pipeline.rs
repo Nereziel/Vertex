@@ -522,6 +522,7 @@ fn builder_asked() -> bool {
 
 /// Why the structure builder's stages do not run, for the frame report.
 #[cfg(all(windows, feature = "diagnostics"))]
+#[allow(dead_code, reason = "reserved for the detailed BVH frame report; preserve the existing runtime logging")]
 pub(crate) fn builder_why() -> String {
     let why = if builder_asked() {
         let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());

@@ -3133,6 +3133,12 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if address == 0 || size == 0 {
+                            // A null CBV is not a scratch allocation or a
+                            // null SRV. Preserve the descriptor's type.
+                            host.constant_at(index, 0, 0);
+                            continue;
+                        }
                         // Mirror `root_view`: when the constant buffer lives in
                         // an existing shadow copy at a 256-byte-aligned host GPU
                         // address and fits within D3D12's 64 KiB CBV limit, bind
@@ -4258,15 +4264,6 @@ mod dispatch_tests {
         );
         // Zero threads along any axis is a no-op.
         assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
-    }
-}
-
-/// The view of no target, in a target's place.
-fn null_target() -> D3D12_RENDER_TARGET_VIEW_DESC {
-    D3D12_RENDER_TARGET_VIEW_DESC {
-        Format: DXGI_FORMAT(28),
-        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
-        ..Default::default()
     }
 }
 

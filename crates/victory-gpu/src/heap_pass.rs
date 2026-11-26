@@ -44,6 +44,7 @@ struct Slot {
     record: Record,
     /// The view is an unordered access one: shaders may store through it
     /// (`crate::heap_marks` asks about every slot kept, every pass).
+    #[cfg(test)]
     unordered: bool,
 }
 
@@ -142,7 +143,10 @@ impl<C: Clone> Picked<C> {
             self.clear();
             return all();
         }
-        let mut due: HashSet<u32> = changed.into_iter().collect();
+        // The result is sorted anyway. Reuse the incoming vector instead
+        // of hashing every changed slot, allocating a hash table, and then
+        // collecting it into another vector. All sources still contribute.
+        let mut due = changed;
         for e in forgotten {
             if let Some(slots) = self.by_entry.remove(&e) {
                 // Only those whose record still names the entry.
@@ -157,7 +161,7 @@ impl<C: Clone> Picked<C> {
         if scan {
             for (&slot, kept) in &self.slots {
                 if record(slot) != Some(kept.record) {
-                    due.insert(slot);
+                    due.push(slot);
                 }
             }
         }
@@ -165,12 +169,12 @@ impl<C: Clone> Picked<C> {
         if scan || orphans_too {
             for (&slot, &seen) in &self.orphans {
                 if orphans_too || record(slot) != Some(seen) {
-                    due.insert(slot);
+                    due.push(slot);
                 }
             }
         }
-        let mut due: Vec<u32> = due.into_iter().collect();
         due.sort_unstable();
+        due.dedup();
         due
     }
 
@@ -220,7 +224,16 @@ impl<C: Clone> Picked<C> {
     ) {
         self.forget(slot);
         self.note_entry(slot, entry);
-        self.slots.insert(slot, Slot { copy: key, from, to, record, unordered });
+        #[cfg(not(test))]
+        let _ = unordered;
+        self.slots.insert(slot, Slot {
+            copy: key,
+            from,
+            to,
+            record,
+            #[cfg(test)]
+            unordered,
+        });
         let c = self.copies.entry(key).or_insert_with(|| Copy {
             copy: copy.clone(),
             slots: HashSet::new(),
@@ -257,6 +270,7 @@ impl<C: Clone> Picked<C> {
 
     /// Every slot kept (whether or not this pass looked at it), and whether
     /// its view is an unordered access one.
+    #[cfg(test)]
     pub(crate) fn unordered(&self) -> impl Iterator<Item = (u32, bool)> + '_ {
         self.slots.iter().map(|(&slot, s)| (slot, s.unordered))
     }
@@ -264,6 +278,7 @@ impl<C: Clone> Picked<C> {
     /// What the view of `slot` reads, if the slot is kept: its host copy,
     /// the range `(from, to)`, and whether the view is an unordered access
     /// one.
+    #[cfg(test)]
     pub(crate) fn view(&self, slot: u32) -> Option<(&C, u64, u64, bool)> {
         let s = self.slots.get(&slot)?;
         Some((&self.copies.get(&s.copy)?.copy, s.from, s.to, s.unordered))
@@ -374,6 +389,24 @@ mod tests {
         // names its old entry 105 and is not.
         assert_eq!(pass(&mut p, &heap, vec![], vec![117, 105]), vec![17]);
         // And the next pass leaves them alone again.
+        assert!(pass(&mut p, &heap, vec![], vec![]).is_empty());
+    }
+
+    #[test]
+    fn due_slots_are_sorted_and_unique_across_all_sources() {
+        let mut heap = heap(8);
+        let mut p = Picked::new(false);
+        p.scan_every = 1;
+        pass(&mut p, &heap, vec![], vec![]);
+        // Slot 2 is marked changed, names a freed entry, and its
+        // record changed past the API. Orphan 6 is also marked twice.
+        p.orphan(6, heap.record(6).unwrap(), Some(106));
+        heap.records.insert(2, [1, 102, 2]);
+        heap.records.insert(6, [1, 106, 2]);
+        assert_eq!(
+            pass(&mut p, &heap, vec![6, 2, 7, 2, 6], vec![102, 106, 102]),
+            vec![2, 6, 7]
+        );
         assert!(pass(&mut p, &heap, vec![], vec![]).is_empty());
     }
 

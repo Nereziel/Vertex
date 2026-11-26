@@ -9,6 +9,7 @@
 
   The build is the `diag` profile with the `diagnostics` feature: the switches
   for finding faults (README, "Debugging") are there when a run needs them.
+  Use -Release for performance tests without diagnostics instrumentation.
 
 .PARAMETER GameExe
   The title's executable.
@@ -36,7 +37,19 @@
 
 .PARAMETER Work
   Where work is done that the processor and the graphics card can both do:
-  cpu (less on the card and less of its memory), balanced, gpu (more on it).
+  cpu (less on the card and less of its memory), balanced, gpu (more on it),
+  auto (experimental balanced profile with runtime memory tuning).
+
+.PARAMETER Release
+  Build and run the optimized release executable (Thin LTO, without
+  diagnostics), including when prebuilding. Default remains diag.
+
+.PARAMETER Tuned
+  The faster submission settings: submissions go ahead of the wait for the
+  card (VICTORY_LATE_WAIT=3) and shader results come back on several threads
+  (VICTORY_WIDE_BACK=1). With the relay on (the default) a run already does
+  both, so this mostly matters where VICTORY_RELAY=0 is set. What is set in
+  the environment already stays.
 
 .PARAMETER LosslessScaling
   Also start Lossless Scaling (a Steam application of its own, not part of
@@ -51,15 +64,19 @@
   .\start.ps1 -Install
 .EXAMPLE
   .\start.ps1 -GameExe 'D:\my-dump\title.exe'
+.EXAMPLE
+  .\start.ps1 -GameExe 'D:\my-dump\title.exe' -Tuned
 #>
 [CmdletBinding()]
 param(
     [string]$GameExe,
     [switch]$Install,
     [ValidateRange(0, 1048576)][int]$LoopLimit = 0,
-    [ValidateSet('cpu', 'balanced', 'gpu')][string]$Work = 'balanced',
+    [ValidateSet('cpu', 'balanced', 'gpu', 'auto')][string]$Work = 'balanced',
     [switch]$Prebuild,
     [switch]$PrebuildAll,
+    [switch]$Tuned,
+    [switch]$Release,
     [switch]$LosslessScaling,
     [switch]$Force
 )
@@ -129,10 +146,12 @@ if ($GameExe) {
 
 $manifest = Join-Path $PSScriptRoot 'Cargo.toml'
 Write-Host 'Building Vertex (minutes the first time)...' -ForegroundColor Cyan
-& cargo build --locked --profile diag -p victory --features diagnostics --manifest-path $manifest
+$profile = if ($Release) { 'release' } else { 'diag' }
+$features = if ($Release) { @() } else { @('--features', 'diagnostics') }
+& cargo build --locked --profile $profile -p victory @features --manifest-path $manifest
 if ($LASTEXITCODE -ne 0) { Stop-Start "the build failed (exit code $LASTEXITCODE)." }
 $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $PSScriptRoot 'target' }
-$victory = Join-Path $target 'diag\victory.exe'
+$victory = Join-Path $target (Join-Path $profile 'victory.exe')
 if (-not (Test-Path -LiteralPath $victory)) { Stop-Start "built, but no $victory" }
 
 Write-Host 'Checking this PC...' -ForegroundColor Cyan
@@ -150,6 +169,11 @@ $settings = @{ VICTORY_GAME_DIR = (Split-Path -Parent $GameExe) }
 # What is set already stays.
 if ($PSBoundParameters.ContainsKey('LoopLimit')) {
     $settings.VICTORY_SHADER_LOOP_LIMIT = if ($LoopLimit) { "$LoopLimit" } else { $null }
+}
+if ($Tuned) {
+    foreach ($pair in @(@('VICTORY_LATE_WAIT', '3'), @('VICTORY_WIDE_BACK', '1'))) {
+        if ($null -eq [Environment]::GetEnvironmentVariable($pair[0])) { $settings[$pair[0]] = $pair[1] }
+    }
 }
 $code = 1
 try {
