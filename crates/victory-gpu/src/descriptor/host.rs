@@ -2062,6 +2062,7 @@ impl HostHeap {
     ) -> u64 {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
+        let mut tabled = 0u64;
         for index in slots {
             let handle = start + index * step;
             let mut whole = [0u8; 32];
@@ -2087,7 +2088,7 @@ impl HostHeap {
             // A table's slot lately: left to its draws, and looked at
             // again next time.
             if !tables && self.tabled_lately(index as u32, frame) {
-                COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tabled += 1;
                 continue;
             }
             let words = |at: usize| u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
@@ -2097,6 +2098,9 @@ impl HostHeap {
             }
             last.store(print, std::sync::atomic::Ordering::Relaxed);
             due.push((index as u32, handle, words));
+        }
+        if tabled != 0 {
+            COPIED_TABLED.fetch_add(tabled, std::sync::atomic::Ordering::Relaxed);
         }
         looked
     }

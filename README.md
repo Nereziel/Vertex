@@ -109,7 +109,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 1. **Close other programs**, browsers first. With little memory free, freezes
    get longer.
 2. **Run twice.** The second start uses the shaders and pipelines of the first.
-3. **Try the faster submission settings:** `.\start.ps1 -GameExe <exe> -Tuned`
+3. **Use `-Release` for FPS measurements** (optimized release build, no diagnostics); keep the default diagnostic build for investigating faults. Try the faster submission settings: `.\start.ps1 -GameExe <exe> -Tuned`
 4. **Change one setting at a time**, set before the start
    (`$env:NAME = 'value'`):
 
