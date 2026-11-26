@@ -45,6 +45,12 @@
   both, so this mostly matters where VICTORY_RELAY=0 is set. What is set in
   the environment already stays.
 
+.PARAMETER FastStreaming
+  Experimental profile for faster world loading: parallel texture staging,
+  persistent physical-page views and parallel WriteWatch. Existing environment
+  overrides take precedence; all settings are restored after the run.
+  Compare against a warm-cache run without this switch.
+
 .PARAMETER LosslessScaling
   Also start Lossless Scaling (a Steam application of its own, not part of
   VIctory), so that its profile for victory.exe or its hotkey can be used.
@@ -70,6 +76,7 @@ param(
     [switch]$Prebuild,
     [switch]$PrebuildAll,
     [switch]$Tuned,
+    [switch]$FastStreaming,
     [switch]$LosslessScaling,
     [switch]$Force
 )
@@ -161,10 +168,16 @@ $settings = @{ VICTORY_GAME_DIR = (Split-Path -Parent $GameExe) }
 if ($PSBoundParameters.ContainsKey('LoopLimit')) {
     $settings.VICTORY_SHADER_LOOP_LIMIT = if ($LoopLimit) { "$LoopLimit" } else { $null }
 }
-if ($Tuned) {
+if ($Tuned -or $FastStreaming) {
     foreach ($pair in @(@('VICTORY_LATE_WAIT', '3'), @('VICTORY_WIDE_BACK', '1'))) {
         if ($null -eq [Environment]::GetEnvironmentVariable($pair[0])) { $settings[$pair[0]] = $pair[1] }
     }
+}
+if ($FastStreaming) {
+    foreach ($name in @('VICTORY_HEAP_WORKER', 'VICTORY_WIDE_TEXTURES', 'VICTORY_XMEM_PERSISTENT_VIEW', 'VICTORY_WATCH_APART')) {
+        if ($null -eq [Environment]::GetEnvironmentVariable($name)) { $settings[$name] = '1' }
+    }
+    Write-Host 'Experimental fast streaming profile (compare with a warm-cache baseline).' -ForegroundColor Yellow
 }
 $code = 1
 try {
