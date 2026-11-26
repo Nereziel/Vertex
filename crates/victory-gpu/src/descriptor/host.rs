@@ -4941,6 +4941,19 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     }
 
     #[test]
+    fn completed_slot_release_never_waits_for_a_contended_heap() {
+        let Some(heap) = HostHeap::new(false, 4) else { return; };
+        let first = heap.dynamic(heap.dynamic).unwrap();
+        {
+            let _held = heap.next.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!heap.try_release(first, 4));
+        }
+        assert_eq!(heap.dynamic(4), None);
+        assert!(heap.try_release(first, 4));
+        assert_eq!(heap.dynamic(4), Some(first));
+    }
+
+    #[test]
     fn dynamic_slots_can_span_the_search_cursor() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
