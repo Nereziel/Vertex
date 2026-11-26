@@ -1188,6 +1188,16 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    if map_workers() > 1 && n >= 8 {
+        // Only parallelise disjoint, contiguous-destination runs. Page-table
+        // edits and placeholder splits stay on the caller under the existing
+        // remap guard; the workers only execute the independent OS mappings.
+        if let Some(runs) = plan_map_runs(&physical, base, pages) {
+            if runs.len() >= 8 {
+                return if map_runs_parallel(&mut physical, &runs) { address } else { std::ptr::null_mut() };
+            }
+        }
+    }
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
@@ -1288,18 +1298,80 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+// Inspired by Vice-Tay 565f4a5. Keep this off by default: the Windows
+// memory manager can serialize these calls, and busy scenes may slow down.
+fn map_workers() -> usize {
+    static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORKERS.get_or_init(|| std::env::var("VICTORY_MAP_THREADS").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 4))
+}
+
+fn plan_map_runs(physical: &Physical, base: usize, pages: &[usize]) -> Option<Vec<(usize, usize, Slice)>> {
+    let mut runs: Vec<(usize, usize, Slice)> = Vec::new();
+    for (i, page) in pages.iter().enumerate() {
+        let slice = physical.pages.get(page)?;
+        let at = base.checked_add(i.checked_mul(PAGE)?)?;
+        if let Some((_, len, first)) = runs.last_mut()
+            && Arc::ptr_eq(&first.section, &slice.section)
+            && first.index.checked_add(*len / PAGE) == Some(slice.index)
+        {
+            *len += PAGE;
+        } else {
+            runs.push((at, PAGE, slice.clone()));
+        }
+    }
+    Some(runs)
+}
+
+fn map_runs_parallel(physical: &mut Physical, runs: &[(usize, usize, Slice)]) -> bool {
+    for group in runs.chunks(32) {
+        // Splitting pieces of a shared placeholder in parallel is unsafe.
+        for &(at, len, _) in group {
+            split_placeholder(at, len);
+        }
+        let mut done = vec![false; group.len()];
+        let width = group.len().div_ceil(map_workers());
+        std::thread::scope(|scope| {
+            for (part, results) in group.chunks(width).zip(done.chunks_mut(width)) {
+                let work = move || {
+                    for ((at, len, slice), ok) in part.iter().zip(results) {
+                        *ok = show_mapping(*at, *len, slice);
+                    }
+                };
+                // Scoped workers finish before the caller records any view.
+                scope.spawn(work);
+            }
+        });
+        let mut ok = true;
+        for ((at, len, slice), done) in group.iter().zip(done) {
+            if done {
+                note_mapping(physical, *at, *len, slice.clone());
+            } else {
+                ok = false;
+            }
+        }
+        if !ok { return false; }
+    }
+    true
+}
+
+fn split_placeholder(base: usize, len: usize) {
+    // SAFETY: acts only on placeholders, as on the original path.
+    unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER); }
+}
+
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
+    split_placeholder(base, len);
+    if !show_mapping(base, len, &slice) { return false; }
+    note_mapping(physical, base, len, slice);
+    true
+}
+
+fn show_mapping(base: usize, len: usize, slice: &Slice) -> bool {
+    // SAFETY: the caller has split the placeholder before mapping.
     let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
         MapViewOfFile3(
             slice.section.handle,
             GetCurrentProcess(),
@@ -1326,6 +1398,10 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    true
+}
+
+fn note_mapping(physical: &mut Physical, base: usize, len: usize, slice: Slice) {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
@@ -1339,7 +1415,6 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
-    true
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
