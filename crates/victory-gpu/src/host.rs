@@ -2370,8 +2370,8 @@ fn inflight_tickets_landed(plans: &[&CardPlan]) {
 /// `completed`: everything ahead of the first flight it has not run. A
 /// later flight never lands before an earlier one, and what follows a
 /// flight (its bottom-of-pipe writes, signals) never before the flight.
-fn landable(line: &[Option<u64>], completed: u64) -> usize {
-    line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
+fn landable(line: impl Iterator<Item = Option<u64>>, completed: u64) -> usize {
+    line.take_while(|f| f.is_none_or(|f| f <= completed)).count()
 }
 
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
@@ -2487,17 +2487,17 @@ mod relay_tests {
     fn flights_land_in_the_order_they_were_sent() {
         // Flight (fence 5), its write, a signal, flight (fence 6), its write.
         let line = [Some(5), None, None, Some(6), None];
-        assert_eq!(landable(&line, 4), 0);
-        assert_eq!(landable(&line, 5), 3);
-        assert_eq!(landable(&line, 6), 5);
-        assert_eq!(landable(&line, u64::MAX), 5);
+        assert_eq!(landable(line.iter().copied(), 4), 0);
+        assert_eq!(landable(line.iter().copied(), 5), 3);
+        assert_eq!(landable(line.iter().copied(), 6), 5);
+        assert_eq!(landable(line.iter().copied(), u64::MAX), 5);
         // Signals with no flight ahead land at once; behind one they wait.
-        assert_eq!(landable(&[None, None], 0), 2);
-        assert_eq!(landable(&[None, Some(9), None], 8), 1);
-        assert_eq!(landable(&[], 3), 0);
+        assert_eq!(landable([None, None].iter().copied(), 0), 2);
+        assert_eq!(landable([None, Some(9), None].iter().copied(), 8), 1);
+        assert_eq!(landable([].iter().copied(), 3), 0);
         // After the first three landed, the rest when its turn comes.
-        assert_eq!(landable(&line[3..], 5), 0);
-        assert_eq!(landable(&line[3..], 6), 2);
+        assert_eq!(landable(line[3..].iter().copied(), 5), 0);
+        assert_eq!(landable(line[3..].iter().copied(), 6), 2);
     }
 
     /// A piece flagged under one range of a plan is fetched under every
@@ -3570,20 +3570,20 @@ fn relay_worker() {
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
-                let fences: Vec<Option<u64>> = line
-                    .line
-                    .iter()
-                    .map(|l| match l {
-                        Late::Run(flight) => Some(flight.fence),
-                        _ => None,
-                    })
-                    .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                // Scan the live queue once under the lock; do not allocate
+                // and populate a temporary vector on every fence wake.
+                let n = landable(line.line.iter().map(|l| match l {
+                    Late::Run(flight) => Some(flight.fence),
+                    _ => None,
+                }), completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
-                    break Err(fences[0].unwrap_or(0));
+                    let Some(Late::Run(flight)) = line.line.front() else {
+                        unreachable!("non-flight entries are always landable");
+                    };
+                    break Err(flight.fence);
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
