@@ -656,8 +656,10 @@ impl Drop for Claim {
 
 /// What the kernel or the guards said of pages `[first, last)`.
 enum Answer {
-    /// Kernel pages (addresses) and guarded pages (64 KiB page numbers).
-    Written(Vec<usize>, Vec<usize>),
+    /// Kernel pages are in the caller's scratch buffer (addresses).
+    Kernel,
+    /// Guarded pages (64 KiB page numbers).
+    Guarded(Vec<usize>),
     /// Neither watched nor a view.
     Unwatched,
     /// A view block turned out to be private memory: ask again.
@@ -666,13 +668,13 @@ enum Answer {
 
 /// The kernel's and the guards' answer for `[first, last)`, without the
 /// journal (as [`writes_into`] asks them).
-fn answer(first: usize, last: usize, guarded: bool) -> Answer {
+fn answer(first: usize, last: usize, guarded: bool, found: &mut Vec<usize>) -> Answer {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let view = guarded && known_view(first * PAGE);
-    let mut found: Vec<usize> = Vec::new();
+    found.clear();
     let failed = view || {
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
         found.resize(count, 0);
@@ -701,7 +703,7 @@ fn answer(first: usize, last: usize, guarded: bool) -> Answer {
         failed_asking(first * PAGE, last * PAGE);
     }
     let result = if !failed {
-        Answer::Written(found, Vec::new())
+        Answer::Kernel
     } else if !guarded {
         Answer::Unwatched
     } else {
@@ -711,13 +713,13 @@ fn answer(first: usize, last: usize, guarded: bool) -> Answer {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
         match pages {
-            Some(pages) => Answer::Written(Vec::new(), pages),
+            Some(pages) => Answer::Guarded(pages),
             None if view => Answer::Again,
             None => Answer::Unwatched,
         }
     };
     #[cfg(feature = "diagnostics")]
-    if matches!(&result, Answer::Written(..)) {
+    if matches!(&result, Answer::Kernel | Answer::Guarded(_)) {
         use crate::copystat::{C, add};
         let elapsed = started.elapsed().as_micros() as u64;
         add(C::Watches, 1);
@@ -730,19 +732,26 @@ fn answer(first: usize, last: usize, guarded: bool) -> Answer {
 /// The journal told what `kernel` (addresses) and `pages` (page numbers)
 /// say was written, at a new asking; what it holds of `[first, last)` put
 /// into `written`; that asking's number.
-fn note(first: usize, last: usize, kernel: Vec<usize>, pages: Vec<usize>, written: &mut Vec<(usize, u64)>) -> u64 {
+fn note(first: usize, last: usize, kernel: &[usize], pages: &[usize], written: &mut Vec<(usize, u64)>) -> u64 {
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     j.asked += 1;
     let now = j.asked;
-    for at in kernel {
+    for &at in kernel {
         j.written.insert(at / PAGE, now);
     }
-    for page in pages {
+    for &page in pages {
         j.written.insert(page, now);
     }
     written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
     now
 }
+
+// Reuse the kernel answer buffer per worker; do not retain unusually large
+// allocations indefinitely (at most 1 MiB of scratch per worker).
+std::thread_local! {
+    static KERNEL_FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+const KERNEL_FOUND_MAX: usize = (1 << 20) / size_of::<usize>();
 
 /// Tests: microseconds put between the kernel's answer and the journal.
 #[cfg(test)]
@@ -768,7 +777,8 @@ fn writes_apart(start: usize, end: usize, guarded: bool, written: &mut Vec<(usiz
                 return Some(j.ahead_asked);
             }
         }
-        let said = answer(first, last, guarded);
+        let mut found = KERNEL_FOUND.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+        let said = answer(first, last, guarded, &mut found);
         // Tests widen the time between the answer and the journal, where a
         // second asking about the same pages would miss what this one found.
         #[cfg(test)]
@@ -778,10 +788,18 @@ fn writes_apart(start: usize, end: usize, guarded: bool, written: &mut Vec<(usiz
                 std::thread::sleep(std::time::Duration::from_micros(us));
             }
         });
-        match said {
-            Answer::Written(kernel, pages) => return Some(note(first, last, kernel, pages, written)),
-            Answer::Unwatched => return None,
-            Answer::Again => {}
+        let result = match said {
+            Answer::Kernel => Some(Some(note(first, last, &found, &[], written))),
+            Answer::Guarded(pages) => Some(Some(note(first, last, &[], &pages, written))),
+            Answer::Unwatched => Some(None),
+            Answer::Again => None,
+        };
+        if found.capacity() <= KERNEL_FOUND_MAX {
+            found.clear();
+            KERNEL_FOUND.with(|slot| *slot.borrow_mut() = found);
+        }
+        if let Some(result) = result {
+            return result;
         }
     }
     None
