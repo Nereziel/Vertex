@@ -142,12 +142,13 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File {
+        file,
+        trace_name: (walls_trace() != 0).then_some(name),
+    });
     put(out, file)
 }
 
@@ -224,6 +225,7 @@ extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
         scheduler.lock().staging = u64::from(size);
+        scheduler.work.notify_all();
     }
     S_OK
 }
@@ -261,6 +263,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    trace_name: Option<String>,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -400,7 +403,7 @@ unsafe impl Send for Job {}
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
     static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
+    static STARTED: OnceLock<usize> = OnceLock::new();
     let scheduler = SCHEDULER
         .get_or_init(|| {
             Some(Scheduler {
@@ -424,8 +427,9 @@ fn scheduler() -> Option<&'static Scheduler> {
             })
         })
         .as_ref()?;
-    STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let started = *STARTED.get_or_init(|| {
+        let available = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count(available, std::env::var("VICTORY_DSTORAGE_WORKERS").ok().as_deref());
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -435,8 +439,17 @@ fn scheduler() -> Option<&'static Scheduler> {
             })
             .count();
         tracing::info!(workers = started, "dstorage: workers");
+        started
     });
-    Some(scheduler)
+    (started != 0).then_some(scheduler)
+}
+
+// Preserve the previous default; allow leaving cores for rendering and tuning
+// disk/decode concurrency without creating another thread pool.
+fn worker_count(available: usize, value: Option<&str>) -> usize {
+    let available = available.max(1);
+    value.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n != 0).map_or(available, |n| n.min(available))
 }
 
 impl Scheduler {
@@ -456,10 +469,6 @@ fn walls_trace() -> u8 {
     })
 }
 
-/// The files opened, by the address of our file object, with their paths
-/// (for the walls trace: a request names its file by that address).
-static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
-
 /// The walls trace's line for a request that is done.
 fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
     let level = walls_trace();
@@ -469,9 +478,9 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     let file = if request.options & MEMORY_SOURCE != 0 {
         "memory".to_string()
     } else {
-        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        // SAFETY: the request keeps the file object alive until completion.
+        unsafe { request.source.cast::<Instance<File>>().as_ref() }
+            .and_then(|f| f.state.trace_name.clone()).unwrap_or_else(|| "?".to_string())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -720,6 +729,7 @@ fn close_lane(id: u64) {
             .unwrap_or_else(|e| e.into_inner());
     }
     lanes.lanes.remove(&id);
+    scheduler.work.notify_all();
     scheduler.finished.notify_all();
 }
 
