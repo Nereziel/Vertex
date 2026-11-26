@@ -5287,10 +5287,16 @@ impl Host {
         let mut landed = Vec::new();
         for item in items {
             match item {
-                Late::Run(flight) => {
+                Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
+                    }
+                    // The fence has completed and the detached recording will
+                    // never be submitted again. Return slots before the helper
+                    // recycles its allocator; never block the relay on a heap.
+                    for list in &mut flight.lists {
+                        list.try_tables_done();
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
