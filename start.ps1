@@ -38,6 +38,13 @@
   Where work is done that the processor and the graphics card can both do:
   cpu (less on the card and less of its memory), balanced, gpu (more on it).
 
+.PARAMETER Tuned
+  The faster submission settings: submissions go ahead of the wait for the
+  card (VICTORY_LATE_WAIT=3) and shader results come back on several threads
+  (VICTORY_WIDE_BACK=1). With the relay on (the default) a run already does
+  both, so this mostly matters where VICTORY_RELAY=0 is set. What is set in
+  the environment already stays.
+
 .PARAMETER LosslessScaling
   Also start Lossless Scaling (a Steam application of its own, not part of
   VIctory), so that its profile for victory.exe or its hotkey can be used.
@@ -51,6 +58,8 @@
   .\start.ps1 -Install
 .EXAMPLE
   .\start.ps1 -GameExe 'D:\my-dump\title.exe'
+.EXAMPLE
+  .\start.ps1 -GameExe 'D:\my-dump\title.exe' -Tuned
 #>
 [CmdletBinding()]
 param(
@@ -60,6 +69,7 @@ param(
     [ValidateSet('cpu', 'balanced', 'gpu')][string]$Work = 'balanced',
     [switch]$Prebuild,
     [switch]$PrebuildAll,
+    [switch]$Tuned,
     [switch]$LosslessScaling,
     [switch]$Force
 )
@@ -150,6 +160,11 @@ $settings = @{ VICTORY_GAME_DIR = (Split-Path -Parent $GameExe) }
 # What is set already stays.
 if ($PSBoundParameters.ContainsKey('LoopLimit')) {
     $settings.VICTORY_SHADER_LOOP_LIMIT = if ($LoopLimit) { "$LoopLimit" } else { $null }
+}
+if ($Tuned) {
+    foreach ($pair in @(@('VICTORY_LATE_WAIT', '3'), @('VICTORY_WIDE_BACK', '1'))) {
+        if ($null -eq [Environment]::GetEnvironmentVariable($pair[0])) { $settings[$pair[0]] = $pair[1] }
+    }
 }
 $code = 1
 try {
