@@ -370,6 +370,19 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Try giving completed slots back without blocking the relay.
+#[cfg(windows)]
+pub(crate) fn try_release_dynamic(heap: usize, first: u32, n: u32) -> bool {
+    let Ok(heaps) = SHADER_HEAPS.try_read() else { return false; };
+    if heaps.iter().any(|&(_, _, h)| h == heap)
+        // SAFETY: registered heaps stay alive under this read lock.
+        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+    {
+        return host.try_release(first, n);
+    }
+    true
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
